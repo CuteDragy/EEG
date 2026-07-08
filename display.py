@@ -8,7 +8,7 @@ from rich.columns import Columns
 from rich import box
 
 # ── Config ───────────────────────────────────────────────────────────────────
-SERVER_URL = "http://localhost:5000"
+SERVER_URL = "https://eeg-a37i.onrender.com"
 FILE_PATH  = r"C:\Users\pzhiy\OneDrive - University of Nottingham Malaysia\Files\Internship\Summer25-26\eeg_server\uploads\S104R01.edf"
 # ─────────────────────────────────────────────────────────────────────────────
 
