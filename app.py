@@ -116,7 +116,7 @@ DATASETS = {}  # dataset_id -> metadata dict
 # to in-memory-only storage; nothing about the API surface changes.
 # --------------------------------------------------------------------------
 
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://test:Test12345678@cluster0.1m2rwpo.mongodb.net/?appName=Cluster0")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://test:EUk6fKxazi4E2JEG@cluster0.1m2rwpo.mongodb.net/?appName=Cluster0")
 MONGO_DB_NAME = os.environ.get("MONGO_DB", "eeg_dataset_server")
 MONGO_COLLECTION = "datasets"
 
