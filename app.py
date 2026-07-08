@@ -827,6 +827,87 @@ def too_large(e):
 def not_found(e):
     return jsonify({"error": "Endpoint not found"}), 404
 
+@app.route("/", methods=["GET"])
+def dashboard():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>EEG Dataset Server</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, sans-serif; background:#0f1117; color:#e6e6e6; margin:0; padding:2rem; }
+  h1 { color:#7dd3fc; }
+  .status { display:inline-block; padding:.25rem .75rem; border-radius:999px; font-size:.85rem; margin-bottom:1.5rem; }
+  .ok { background:#14532d; color:#86efac; }
+  .bad { background:#7f1d1d; color:#fca5a5; }
+  table { width:100%; border-collapse:collapse; margin-top:1rem; }
+  th, td { text-align:left; padding:.6rem .8rem; border-bottom:1px solid #262a35; font-size:.9rem; }
+  th { color:#94a3b8; font-weight:600; }
+  tr:hover { background:#1a1d27; }
+  .pill { padding:.15rem .5rem; border-radius:6px; font-size:.75rem; }
+  .success { background:#14532d; color:#86efac; }
+  .error { background:#7f1d1d; color:#fca5a5; }
+  .empty { color:#64748b; padding:2rem 0; text-align:center; }
+  a { color:#7dd3fc; }
+</style>
+</head>
+<body>
+  <h1>🧠 EEG Dataset Server</h1>
+  <span id="statusPill" class="status">checking…</span>
+  <div id="counts" style="color:#94a3b8; margin-bottom:1rem;"></div>
+  <table>
+    <thead>
+      <tr><th>Filename</th><th>Format</th><th>Size</th><th>Uploaded</th><th>Status</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="emptyMsg" class="empty" style="display:none;">No datasets uploaded yet.</div>
+
+<script>
+async function load() {
+  try {
+    const health = await (await fetch("/health")).json();
+    const pill = document.getElementById("statusPill");
+    pill.textContent = health.mongo_connected ? "● online (db connected)" : "● online (in-memory only)";
+    pill.className = "status " + (health.mongo_connected ? "ok" : "bad");
+
+    const data = await (await fetch("/datasets")).json();
+    document.getElementById("counts").textContent = `${data.count} dataset(s) recorded`;
+
+    const rows = document.getElementById("rows");
+    const emptyMsg = document.getElementById("emptyMsg");
+    rows.innerHTML = "";
+
+    if (!data.datasets.length) {
+      emptyMsg.style.display = "block";
+      return;
+    }
+    emptyMsg.style.display = "none";
+
+    data.datasets.forEach(ds => {
+      const mb = (ds.file_size_bytes / (1024*1024)).toFixed(2);
+      const statusClass = ds.parse_status === "ok" ? "success" : "error";
+      rows.innerHTML += `
+        <tr>
+          <td><a href="/datasets/${ds.dataset_id}">${ds.original_filename}</a></td>
+          <td>${ds.extension.toUpperCase()}</td>
+          <td>${mb} MB</td>
+          <td>${new Date(ds.uploaded_at).toLocaleString()}</td>
+          <td><span class="pill ${statusClass}">${ds.parse_status}</span></td>
+        </tr>`;
+    });
+  } catch (e) {
+    document.getElementById("statusPill").textContent = "● error loading status";
+    document.getElementById("statusPill").className = "status bad";
+  }
+}
+load();
+setInterval(load, 10000); // auto-refresh every 10s
+</script>
+</body>
+</html>
+"""
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
