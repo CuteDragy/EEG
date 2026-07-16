@@ -972,20 +972,11 @@ def view_dataset(dataset_id):
 
 @app.route("/datasets/<dataset_id>/channel/<int:channel_idx>", methods=["GET"])
 def get_channel_data(dataset_id, channel_idx):
-    """
-    Returns time-series and FFT for a specific channel of an EDF dataset.
-    Query params:
-      ?mode=time   -> return the raw time series (decimated if needed)
-      ?mode=fft    -> return frequency and magnitude arrays
-      ?mode=both   -> return both (default)
-      ?max_points=1000  -> limit the number of points (for time series)
-      ?max_freq=50      -> limit FFT frequency range (default: Nyquist)
-    """
     ds = DATASETS.get(dataset_id)
     if ds is None:
         return jsonify({"error": "Dataset not found"}), 404
     if ds["extension"] != "edf":
-        return jsonify({"error": "Only EDF files support channel data right now"}), 400
+        return jsonify({"error": "Only EDF files support channel data"}), 400
 
     filepath = os.path.join(app.config["UPLOAD_FOLDER"], ds["stored_filename"])
     if not os.path.exists(filepath):
@@ -993,17 +984,21 @@ def get_channel_data(dataset_id, channel_idx):
     if not os.path.exists(filepath):
         return jsonify({"error": "File not found"}), 410
 
+    # Try to use MNE; if it fails, fall back to a simple manual read?
     try:
         import mne
         raw = mne.io.read_raw_edf(filepath, preload=True, verbose="ERROR")
         sfreq = raw.info["sfreq"]
-        if channel_idx < 0 or channel_idx >= len(raw.ch_names):
+        ch_names = raw.ch_names
+        if channel_idx < 0 or channel_idx >= len(ch_names):
             return jsonify({"error": "Channel index out of range"}), 400
         data, times = raw[channel_idx, :]
         data = data.flatten()
-        ch_name = raw.ch_names[channel_idx]
+        ch_name = ch_names[channel_idx]
     except Exception as e:
-        return jsonify({"error": f"Failed to read EDF data: {str(e)}"}), 500
+        # Log the error and return a friendly message
+        logger.error("Failed to read EDF with MNE: %s", e)
+        return jsonify({"error": f"Failed to read EDF: {str(e)}"}), 500
 
     mode = request.args.get("mode", "both")
     max_points = int(request.args.get("max_points", 1000))

@@ -559,6 +559,12 @@ info.format %}
 
       fetch(`/datasets/${datasetId}/channel/${idx}?mode=both&max_points=1500&max_freq=50`)
         .then(res => res.json())
+        .then(res => {
+          if (!res.ok) {
+            return res.json().then(err => { throw new Error(err.error || 'Server error'); });
+          }
+          return res.json();
+        })
         .then(data => {
           // Time chart
           const ctxTime = document.getElementById('timeChart').getContext('2d');

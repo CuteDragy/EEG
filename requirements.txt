@@ -4,7 +4,8 @@ pandas==2.2.2
 numpy==1.26.4
 pymongo==4.8.0
 gunicorn==22.0.0
-mne==1.7.1
+mne==1.6.1
+scipy==1.11.4
  
 # Optional: MNE enrichment layer. Uncomment if you need it - it adds
 # significant install size/RAM, which may be tight on Render's free tier.
