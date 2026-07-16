@@ -32,7 +32,7 @@ MNE integration (optional, additive):
 
 Run:
     python app.py
-    # Server starts on http://0.0.0.0:5000
+    # Server starts on http://0.0.0.0:0
 
 Endpoints:
     GET    /health                        -> service liveness check
@@ -1206,7 +1206,7 @@ setInterval(load, 10000); // auto-refresh every 10s
 """
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 0))
     debug_mode = os.environ.get("FLASK_DEBUG", "true").lower() in ("1", "true", "yes")
     logger.info("Starting EEG dataset server on http://0.0.0.0:%s", port)
     # use_reloader=False: avoids the file watcher scanning the whole
