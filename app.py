@@ -81,10 +81,12 @@ except ImportError:
 try:
     from pymongo import MongoClient
     from pymongo.errors import PyMongoError
+    import gridfs
     PYMONGO_AVAILABLE = True
 except ImportError:
     MongoClient = None
     PyMongoError = Exception
+    gridfs = None
     PYMONGO_AVAILABLE = False
 
 # --------------------------------------------------------------------------
@@ -135,6 +137,7 @@ MONGO_COLLECTION = "datasets"
 
 mongo_client = None
 mongo_collection = None
+mongo_fs = None  # GridFS bucket - stores the raw uploaded file bytes durably
 MONGO_CONNECTED = False
 
 if PYMONGO_AVAILABLE:
@@ -143,11 +146,13 @@ if PYMONGO_AVAILABLE:
         mongo_client.admin.command("ping")  # fail fast if unreachable
         mongo_db = mongo_client[MONGO_DB_NAME]
         mongo_collection = mongo_db[MONGO_COLLECTION]
+        mongo_fs = gridfs.GridFS(mongo_db, collection="dataset_files")
         MONGO_CONNECTED = True
     except Exception as e:
         logging.getLogger("eeg-server").warning("MongoDB unavailable, falling back to in-memory only: %s", e)
         mongo_client = None
         mongo_collection = None
+        mongo_fs = None
         MONGO_CONNECTED = False
 
 
@@ -176,9 +181,59 @@ def mongo_delete(dataset_id):
         return False
 
 
+def gridfs_save(dataset_id, filepath, filename):
+    """Store the raw uploaded file's bytes in GridFS, keyed by dataset_id, so
+    the data survives server restarts / redeploys (the local disk under
+    UPLOAD_FOLDER is ephemeral on most hosts, e.g. Render). Returns the
+    GridFS file id (as a str) on success, or None if unavailable/failed."""
+    if not MONGO_CONNECTED or mongo_fs is None:
+        return None
+    try:
+        with open(filepath, "rb") as fh:
+            file_id = mongo_fs.put(fh, filename=filename, dataset_id=dataset_id)
+        return str(file_id)
+    except Exception as e:
+        logger.error("GridFS save failed for dataset %s: %s", dataset_id, e)
+        return None
+
+
+def gridfs_delete(gridfs_file_id):
+    if not MONGO_CONNECTED or mongo_fs is None or not gridfs_file_id:
+        return False
+    try:
+        from bson import ObjectId
+        mongo_fs.delete(ObjectId(gridfs_file_id))
+        return True
+    except Exception as e:
+        logger.error("GridFS delete failed for file %s: %s", gridfs_file_id, e)
+        return False
+
+
+def gridfs_restore_to_disk(gridfs_file_id, filepath):
+    """Write the GridFS-stored bytes back out to filepath if they aren't
+    already there. Used at startup (and lazily on access) to rehydrate files
+    after a restart wiped the ephemeral local disk."""
+    if not MONGO_CONNECTED or mongo_fs is None or not gridfs_file_id:
+        return False
+    if os.path.exists(filepath):
+        return True
+    try:
+        from bson import ObjectId
+        grid_out = mongo_fs.get(ObjectId(gridfs_file_id))
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "wb") as fh:
+            fh.write(grid_out.read())
+        return True
+    except Exception as e:
+        logger.error("GridFS restore-to-disk failed for file %s: %s", gridfs_file_id, e)
+        return False
+
+
 def mongo_load_all():
     """Load all previously persisted datasets back into the in-memory cache
-    (called once at startup so restarts don't lose data)."""
+    (called once at startup so restarts don't lose data), and rehydrate each
+    dataset's raw file from GridFS onto local disk since UPLOAD_FOLDER itself
+    does not survive a restart on most hosts."""
     if not MONGO_CONNECTED:
         return 0
     loaded = 0
@@ -187,6 +242,10 @@ def mongo_load_all():
             doc.pop("_id", None)
             DATASETS[doc["dataset_id"]] = doc
             loaded += 1
+            gridfs_file_id = doc.get("gridfs_file_id")
+            if gridfs_file_id:
+                filepath = os.path.join(UPLOAD_FOLDER, doc["stored_filename"])
+                gridfs_restore_to_disk(gridfs_file_id, filepath)
     except PyMongoError as e:
         logger.error("MongoDB load-all failed: %s", e)
     return loaded
@@ -784,6 +843,12 @@ def upload():
 
     elapsed_ms = round((time.time() - start_time) * 1000, 2)
 
+    # Store the raw bytes in GridFS so the actual file (not just its parsed
+    # metadata) survives a server restart/redeploy, since UPLOAD_FOLDER lives
+    # on ephemeral local disk. This is the only way the data goes away short
+    # of an explicit delete.
+    gridfs_file_id = gridfs_save(dataset_id, filepath, original_filename)
+
     record = {
         "dataset_id": dataset_id,
         "original_filename": original_filename,
@@ -795,10 +860,12 @@ def upload():
         "parse_error": parse_error,
         "processing_time_ms": elapsed_ms,
         "info": parsed_info,
+        "gridfs_file_id": gridfs_file_id,
     }
     DATASETS[dataset_id] = record
     mongo_ok = mongo_save(record)
     record["persisted_to_db"] = mongo_ok
+    record["file_persisted"] = gridfs_file_id is not None
 
     status_code = 200 if not parse_error else 422
     log_fn = logger.info if not parse_error else logger.warning
@@ -889,6 +956,7 @@ def delete_dataset(dataset_id):
             os.remove(filepath)
     except Exception as e:
         logger.error("Failed to delete file for %s: %s", dataset_id, e)
+    gridfs_delete(ds.get("gridfs_file_id"))
     mongo_delete(dataset_id)
     logger.info("Deleted dataset %s", dataset_id)
     return jsonify({"deleted": dataset_id}), 200
@@ -924,6 +992,7 @@ def delete_datasets_bulk():
                 os.remove(filepath)
         except Exception as e:
             logger.error("Failed to delete file for %s: %s", dataset_id, e)
+        gridfs_delete(ds.get("gridfs_file_id"))
         mongo_delete(dataset_id)
         deleted.append(dataset_id)
 
@@ -958,7 +1027,9 @@ def download_dataset(dataset_id):
         return jsonify({"error": "Dataset not found"}), 404
     filepath = os.path.join(app.config["UPLOAD_FOLDER"], ds["stored_filename"])
     if not os.path.exists(filepath):
-        logger.warning("Download failed, file missing on disk: %s", filepath)
+        gridfs_restore_to_disk(ds.get("gridfs_file_id"), filepath)
+    if not os.path.exists(filepath):
+        logger.warning("Download failed, file missing on disk and in GridFS: %s", filepath)
         return jsonify({"error": "File no longer exists on server"}), 410
     logger.info("Downloading dataset %s (%s)", dataset_id, ds["original_filename"])
     return send_file(filepath, as_attachment=True, download_name=ds["original_filename"])
@@ -973,6 +1044,8 @@ def reparse_dataset(dataset_id):
         return jsonify({"error": "Dataset not found"}), 404
 
     filepath = os.path.join(app.config["UPLOAD_FOLDER"], ds["stored_filename"])
+    if not os.path.exists(filepath):
+        gridfs_restore_to_disk(ds.get("gridfs_file_id"), filepath)
     if not os.path.exists(filepath):
         return jsonify({"error": "Original file no longer exists on server"}), 410
 
