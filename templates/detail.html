@@ -332,7 +332,8 @@ info.format %}
         <tr>
           <td>Channels</td>
           <td>
-            {{ info.mne.n_channels }} ({{ info.mne.ch_types_guess_summary | format_channel_types }})</td>
+            {{ info.mne.n_channels }} ({{ info.mne.ch_types_guess_summary |
+            format_channel_types }})
           </td>
         </tr>
         <tr>
@@ -388,7 +389,8 @@ info.format %}
         <tr>
           <td>Event ID map</td>
           <td>
-            {{ info.mne.annotations.events_from_annotations.event_id_map | format_event_id_map }}</td>
+            {{ info.mne.annotations.events_from_annotations.event_id_map |
+            format_event_id_map }}
           </td>
         </tr>
         {% endif %}
@@ -556,9 +558,9 @@ info.format %}
       if (isNaN(idx)) return;
 
       fetch(`/datasets/${datasetId}/channel/${idx}?mode=both&max_points=1500&max_freq=50`)
-        .then(res => res.json())
         .then(res => {
           if (!res.ok) {
+            // Handle error response
             return res.json().then(err => { throw new Error(err.error || 'Server error'); });
           }
           return res.json();
