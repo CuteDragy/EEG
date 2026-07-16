@@ -35,11 +35,24 @@ Run:
     # Server starts on http://0.0.0.0:5000
 
 Endpoints:
-    GET  /health                  -> service liveness check
-    POST /upload                  -> upload a dataset file, returns parsed info
-    GET  /datasets                -> list all uploaded datasets (summary)
-    GET  /datasets/<dataset_id>   -> full info for one dataset
-    DELETE /datasets/<dataset_id> -> remove a dataset record + file
+    GET    /health                        -> service liveness check
+    GET    /stats                         -> storage/dataset aggregate stats
+    POST   /upload                        -> upload a dataset file, returns parsed info
+    GET    /datasets                      -> list datasets (search/filter/sort/paginate)
+    GET    /datasets/<dataset_id>         -> full info for one dataset
+    PATCH  /datasets/<dataset_id>         -> rename a dataset's display filename
+    DELETE /datasets/<dataset_id>         -> remove a dataset record + file
+    DELETE /datasets                      -> bulk delete (?ids=a,b,c or ?confirm=true for all)
+    GET    /datasets/<dataset_id>/download -> download the original uploaded file
+    POST   /datasets/<dataset_id>/reparse  -> re-run parsing with new query-param opts
+
+    /datasets query params (all optional, combinable):
+      ?search=name       case-insensitive filename substring match
+      ?format=edf        filter by extension (csv/tsv/edf/npy/json)
+      ?status=ok|error   filter by parse_status
+      ?sort=uploaded_at|file_size_bytes|original_filename  (default: uploaded_at)
+      ?order=asc|desc    (default: desc)
+      ?limit=20&offset=0 pagination
 """
 
 import io
@@ -54,7 +67,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from werkzeug.utils import secure_filename
 
 try:
@@ -698,6 +711,26 @@ def health():
     }), 200
 
 
+@app.route("/stats", methods=["GET"])
+def stats():
+    logger.debug("Stats requested")
+    total_bytes = sum(ds["file_size_bytes"] for ds in DATASETS.values())
+    by_format = {}
+    by_status = {"ok": 0, "error": 0}
+    for ds in DATASETS.values():
+        fmt = ds["extension"]
+        by_format[fmt] = by_format.get(fmt, 0) + 1
+        by_status[ds["parse_status"]] = by_status.get(ds["parse_status"], 0) + 1
+    return jsonify({
+        "count": len(DATASETS),
+        "total_size_bytes": total_bytes,
+        "total_size_mb": round(total_bytes / (1024 * 1024), 2),
+        "by_format": by_format,
+        "by_status": by_status,
+        "mongo_connected": MONGO_CONNECTED,
+    }), 200
+
+
 @app.route("/upload", methods=["POST"])
 def upload():
     start_time = time.time()
@@ -777,20 +810,63 @@ def upload():
     return jsonify(record), status_code
 
 
+def dataset_summary(ds):
+    return {
+        "dataset_id": ds["dataset_id"],
+        "original_filename": ds["original_filename"],
+        "extension": ds["extension"],
+        "file_size_bytes": ds["file_size_bytes"],
+        "uploaded_at": ds["uploaded_at"],
+        "parse_status": ds["parse_status"],
+    }
+
+
 @app.route("/datasets", methods=["GET"])
 def list_datasets():
-    logger.debug("Listing %d dataset(s)", len(DATASETS))
-    summaries = []
-    for ds in DATASETS.values():
-        summaries.append({
-            "dataset_id": ds["dataset_id"],
-            "original_filename": ds["original_filename"],
-            "extension": ds["extension"],
-            "file_size_bytes": ds["file_size_bytes"],
-            "uploaded_at": ds["uploaded_at"],
-            "parse_status": ds["parse_status"],
-        })
-    return jsonify({"count": len(summaries), "datasets": summaries}), 200
+    args = request.args
+    items = list(DATASETS.values())
+
+    search = args.get("search", "").strip().lower()
+    if search:
+        items = [d for d in items if search in d["original_filename"].lower()]
+
+    fmt = args.get("format", "").strip().lower()
+    if fmt:
+        items = [d for d in items if d["extension"] == fmt]
+
+    status = args.get("status", "").strip().lower()
+    if status:
+        items = [d for d in items if d["parse_status"] == status]
+
+    sort_key = args.get("sort", "uploaded_at")
+    if sort_key not in ("uploaded_at", "file_size_bytes", "original_filename"):
+        sort_key = "uploaded_at"
+    reverse = args.get("order", "desc").strip().lower() != "asc"
+    items.sort(key=lambda d: d[sort_key], reverse=reverse)
+
+    total_matched = len(items)
+
+    try:
+        offset = max(0, int(args.get("offset", 0)))
+    except ValueError:
+        offset = 0
+    try:
+        limit = int(args.get("limit", 0)) or None
+    except ValueError:
+        limit = None
+    if limit is not None:
+        items = items[offset:offset + limit]
+    elif offset:
+        items = items[offset:]
+
+    logger.debug("Listing %d dataset(s) (matched %d of %d total)",
+                  len(items), total_matched, len(DATASETS))
+    return jsonify({
+        "count": len(items),
+        "total_matched": total_matched,
+        "total": len(DATASETS),
+        "datasets": [dataset_summary(d) for d in items],
+    }), 200
 
 
 @app.route("/datasets/<dataset_id>", methods=["GET"])
@@ -816,6 +892,112 @@ def delete_dataset(dataset_id):
     mongo_delete(dataset_id)
     logger.info("Deleted dataset %s", dataset_id)
     return jsonify({"deleted": dataset_id}), 200
+
+
+@app.route("/datasets", methods=["DELETE"])
+def delete_datasets_bulk():
+    """
+    Bulk delete. Two modes:
+      DELETE /datasets?ids=id1,id2,id3   -> delete just those
+      DELETE /datasets?confirm=true      -> wipe every dataset (destructive)
+    """
+    ids_param = request.args.get("ids", "").strip()
+    confirm = request.args.get("confirm", "false").strip().lower() == "true"
+
+    if not ids_param and not confirm:
+        return jsonify({
+            "error": "Refusing to delete. Pass ?ids=id1,id2 for specific datasets, "
+                     "or ?confirm=true to delete ALL datasets."
+        }), 400
+
+    target_ids = [i.strip() for i in ids_param.split(",") if i.strip()] if ids_param else list(DATASETS.keys())
+
+    deleted, missing = [], []
+    for dataset_id in target_ids:
+        ds = DATASETS.pop(dataset_id, None)
+        if ds is None:
+            missing.append(dataset_id)
+            continue
+        try:
+            filepath = os.path.join(app.config["UPLOAD_FOLDER"], ds["stored_filename"])
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception as e:
+            logger.error("Failed to delete file for %s: %s", dataset_id, e)
+        mongo_delete(dataset_id)
+        deleted.append(dataset_id)
+
+    logger.info("Bulk delete: %d deleted, %d missing", len(deleted), len(missing))
+    return jsonify({"deleted": deleted, "not_found": missing, "deleted_count": len(deleted)}), 200
+
+
+@app.route("/datasets/<dataset_id>", methods=["PATCH"])
+def rename_dataset(dataset_id):
+    """Rename a dataset's display filename (metadata only - stored file/path unchanged)."""
+    ds = DATASETS.get(dataset_id)
+    if ds is None:
+        return jsonify({"error": "Dataset not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    new_name = (body.get("original_filename") or "").strip()
+    if not new_name:
+        return jsonify({"error": "Provide JSON body: {\"original_filename\": \"new_name.edf\"}"}), 400
+
+    new_name = secure_filename(new_name)
+    old_name = ds["original_filename"]
+    ds["original_filename"] = new_name
+    mongo_save(ds)
+    logger.info("Renamed dataset %s: '%s' -> '%s'", dataset_id, old_name, new_name)
+    return jsonify(ds), 200
+
+
+@app.route("/datasets/<dataset_id>/download", methods=["GET"])
+def download_dataset(dataset_id):
+    ds = DATASETS.get(dataset_id)
+    if ds is None:
+        return jsonify({"error": "Dataset not found"}), 404
+    filepath = os.path.join(app.config["UPLOAD_FOLDER"], ds["stored_filename"])
+    if not os.path.exists(filepath):
+        logger.warning("Download failed, file missing on disk: %s", filepath)
+        return jsonify({"error": "File no longer exists on server"}), 410
+    logger.info("Downloading dataset %s (%s)", dataset_id, ds["original_filename"])
+    return send_file(filepath, as_attachment=True, download_name=ds["original_filename"])
+
+
+@app.route("/datasets/<dataset_id>/reparse", methods=["POST"])
+def reparse_dataset(dataset_id):
+    """Re-run parsing on an already-uploaded file with different query-param opts,
+    e.g. POST /datasets/<id>/reparse?mne=false or ?sfreq=256 - without re-uploading."""
+    ds = DATASETS.get(dataset_id)
+    if ds is None:
+        return jsonify({"error": "Dataset not found"}), 404
+
+    filepath = os.path.join(app.config["UPLOAD_FOLDER"], ds["stored_filename"])
+    if not os.path.exists(filepath):
+        return jsonify({"error": "Original file no longer exists on server"}), 410
+
+    parser = PARSERS.get(ds["extension"])
+    opts = build_parse_opts(request.args)
+    start_time = time.time()
+    parse_error = None
+    parsed_info = {}
+    try:
+        parsed_info = parser(filepath, opts)
+    except Exception as e:
+        parse_error = str(e)
+        logger.error("Reparse failed for %s: %s\n%s", dataset_id, e, traceback.format_exc())
+
+    ds["parse_status"] = "error" if parse_error else "ok"
+    ds["parse_error"] = parse_error
+    ds["processing_time_ms"] = round((time.time() - start_time) * 1000, 2)
+    ds["info"] = parsed_info
+    ds["reparsed_at"] = now_iso()
+    mongo_ok = mongo_save(ds)
+    ds["persisted_to_db"] = mongo_ok
+
+    status_code = 200 if not parse_error else 422
+    logger.info("Reparsed dataset %s: status=%s", dataset_id, ds["parse_status"])
+    return jsonify(ds), status_code
 
 
 @app.errorhandler(413)
@@ -856,13 +1038,27 @@ def dashboard():
   <h1>🧠 EEG Dataset Server</h1>
   <span id="statusPill" class="status">checking…</span>
   <div id="counts" style="color:#94a3b8; margin-bottom:1rem;"></div>
+
+  <div style="display:flex; gap:.5rem; margin-bottom:1rem; flex-wrap:wrap;">
+    <input id="searchBox" placeholder="Search filename…" style="flex:1; min-width:180px; background:#161923; border:1px solid #262a35; color:#e6e6e6; padding:.5rem .75rem; border-radius:6px;">
+    <select id="formatFilter" style="background:#161923; border:1px solid #262a35; color:#e6e6e6; padding:.5rem .75rem; border-radius:6px;">
+      <option value="">All formats</option>
+      <option value="edf">EDF</option>
+      <option value="csv">CSV</option>
+      <option value="tsv">TSV</option>
+      <option value="npy">NPY</option>
+      <option value="json">JSON</option>
+    </select>
+    <button id="deleteAllBtn" style="background:#7f1d1d; color:#fca5a5; border:none; padding:.5rem 1rem; border-radius:6px; cursor:pointer;">Delete all</button>
+  </div>
+
   <table>
     <thead>
-      <tr><th>Filename</th><th>Format</th><th>Size</th><th>Uploaded</th><th>Status</th></tr>
+      <tr><th>Filename</th><th>Format</th><th>Size</th><th>Uploaded</th><th>Status</th><th></th></tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
-  <div id="emptyMsg" class="empty" style="display:none;">No datasets uploaded yet.</div>
+  <div id="emptyMsg" class="empty" style="display:none;">No datasets found.</div>
 
 <script>
 async function load() {
@@ -872,8 +1068,15 @@ async function load() {
     pill.textContent = health.mongo_connected ? "● online (db connected)" : "● online (in-memory only)";
     pill.className = "status " + (health.mongo_connected ? "ok" : "bad");
 
-    const data = await (await fetch("/datasets")).json();
-    document.getElementById("counts").textContent = `${data.count} dataset(s) recorded`;
+    const search = document.getElementById("searchBox").value.trim();
+    const format = document.getElementById("formatFilter").value;
+    const params = new URLSearchParams();
+    if (search) params.set("search", search);
+    if (format) params.set("format", format);
+
+    const data = await (await fetch("/datasets?" + params.toString())).json();
+    document.getElementById("counts").textContent =
+      `${data.total_matched} of ${data.total} dataset(s) shown`;
 
     const rows = document.getElementById("rows");
     const emptyMsg = document.getElementById("emptyMsg");
@@ -895,6 +1098,10 @@ async function load() {
           <td>${mb} MB</td>
           <td>${new Date(ds.uploaded_at).toLocaleString()}</td>
           <td><span class="pill ${statusClass}">${ds.parse_status}</span></td>
+          <td style="white-space:nowrap;">
+            <a href="/datasets/${ds.dataset_id}/download" style="margin-right:.75rem;">↓</a>
+            <a href="#" onclick="removeDataset('${ds.dataset_id}'); return false;" style="color:#fca5a5;">✕</a>
+          </td>
         </tr>`;
     });
   } catch (e) {
@@ -902,6 +1109,22 @@ async function load() {
     document.getElementById("statusPill").className = "status bad";
   }
 }
+
+async function removeDataset(id) {
+  if (!confirm("Delete this dataset? This removes the file and its record.")) return;
+  await fetch(`/datasets/${id}`, { method: "DELETE" });
+  load();
+}
+
+document.getElementById("deleteAllBtn").addEventListener("click", async () => {
+  if (!confirm("Delete ALL datasets? This cannot be undone.")) return;
+  await fetch("/datasets?confirm=true", { method: "DELETE" });
+  load();
+});
+
+document.getElementById("searchBox").addEventListener("input", () => load());
+document.getElementById("formatFilter").addEventListener("change", () => load());
+
 load();
 setInterval(load, 10000); // auto-refresh every 10s
 </script>

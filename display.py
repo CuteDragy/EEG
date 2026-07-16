@@ -1,4 +1,7 @@
+import argparse
 import os
+import sys
+
 import requests
 import rich
 from rich.console import Console
@@ -9,7 +12,7 @@ from rich import box
 
 # ── Config ───────────────────────────────────────────────────────────────────
 SERVER_URL = "https://eeg-a37i.onrender.com"
-FILE_PATH  = r"C:\Users\pzhiy\OneDrive - University of Nottingham Malaysia\Files\Internship\Summer25-26\EEG\uploads\S104R01.edf"
+FILE_PATH  = r"C:\Users\pzhiy\OneDrive - University of Nottingham Malaysia\Files\Internship\Summer25-26\EEG\uploads\S001R01.edf"
 # ─────────────────────────────────────────────────────────────────────────────
 
 console = Console()
@@ -252,6 +255,175 @@ def display_mne_section(mne_info):
     ], equal=True, expand=True))
 
 
-if __name__ == "__main__":
-    result = upload(FILE_PATH)
+# ── File management (list / view / rename / delete / download / stats) ───────
+
+def api_get(path: str, **params) -> dict:
+    resp = requests.get(f"{SERVER_URL}{path}", params=params)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def cmd_list(args):
+    data = api_get(
+        "/datasets",
+        search=args.search or "", format=args.format or "", status=args.status or "",
+        sort=args.sort, order=args.order, limit=args.limit or 0, offset=args.offset,
+    )
+    console.print(f"[dim]{data['total_matched']} of {data['total']} dataset(s)[/dim]\n")
+
+    table = Table(box=box.SIMPLE_HEAD, header_style="bold cyan", border_style="dim")
+    table.add_column("ID", style="dim", width=10)
+    table.add_column("Filename", style="white")
+    table.add_column("Format", justify="center")
+    table.add_column("Size", justify="right")
+    table.add_column("Uploaded", style="dim")
+    table.add_column("Status")
+    for ds in data["datasets"]:
+        mb = ds["file_size_bytes"] / (1024 * 1024)
+        status_style = "green" if ds["parse_status"] == "ok" else "red"
+        table.add_row(
+            ds["dataset_id"][:8],
+            ds["original_filename"],
+            ds["extension"].upper(),
+            f"{mb:.2f} MB",
+            ds["uploaded_at"],
+            f"[{status_style}]{ds['parse_status']}[/{status_style}]",
+        )
+    console.print(table)
+
+
+def cmd_view(args):
+    ds_id = resolve_id(args.dataset_id)
+    data = api_get(f"/datasets/{ds_id}")
+    display(data)
+
+
+def cmd_stats(args):
+    data = api_get("/stats")
+    meta = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
+    meta.add_column(style="dim", no_wrap=True)
+    meta.add_column(style="white")
+    meta.add_row("Datasets",  str(data["count"]))
+    meta.add_row("Total size", f"{data['total_size_mb']} MB")
+    meta.add_row("By format", ", ".join(f"{k}={v}" for k, v in data["by_format"].items()) or "—")
+    meta.add_row("By status", ", ".join(f"{k}={v}" for k, v in data["by_status"].items()) or "—")
+    meta.add_row("DB connected", "yes" if data["mongo_connected"] else "no")
+    console.print(Panel(meta, title="[bold]Server Stats[/bold]", border_style="cyan"))
+
+
+def cmd_delete(args):
+    ds_id = resolve_id(args.dataset_id)
+    if not args.yes:
+        confirm = console.input(f"[yellow]Delete dataset {ds_id[:8]}? [y/N]: [/yellow]")
+        if confirm.strip().lower() != "y":
+            console.print("[dim]Cancelled.[/dim]")
+            return
+    resp = requests.delete(f"{SERVER_URL}/datasets/{ds_id}")
+    resp.raise_for_status()
+    console.print(f"[green]✔ Deleted[/green] {ds_id}")
+
+
+def cmd_delete_all(args):
+    if not args.yes:
+        confirm = console.input("[bold red]Delete ALL datasets? This cannot be undone. [y/N]: [/bold red]")
+        if confirm.strip().lower() != "y":
+            console.print("[dim]Cancelled.[/dim]")
+            return
+    resp = requests.delete(f"{SERVER_URL}/datasets", params={"confirm": "true"})
+    resp.raise_for_status()
+    data = resp.json()
+    console.print(f"[green]✔ Deleted {data['deleted_count']} dataset(s)[/green]")
+
+
+def cmd_download(args):
+    ds_id = resolve_id(args.dataset_id)
+    resp = requests.get(f"{SERVER_URL}/datasets/{ds_id}/download")
+    resp.raise_for_status()
+    filename = args.output
+    if not filename:
+        cd = resp.headers.get("Content-Disposition", "")
+        filename = cd.split("filename=")[-1].strip('"') if "filename=" in cd else f"{ds_id}.bin"
+    with open(filename, "wb") as f:
+        f.write(resp.content)
+    console.print(f"[green]✔ Saved to[/green] {filename}")
+
+
+def cmd_rename(args):
+    ds_id = resolve_id(args.dataset_id)
+    resp = requests.patch(f"{SERVER_URL}/datasets/{ds_id}", json={"original_filename": args.new_name})
+    resp.raise_for_status()
+    console.print(f"[green]✔ Renamed to[/green] {resp.json()['original_filename']}")
+
+
+def cmd_upload(args):
+    result = upload(args.filepath)
     display(result)
+
+
+def resolve_id(partial_id: str) -> str:
+    """Allows using a short 8-char prefix (as shown by `list`) instead of the full UUID."""
+    if len(partial_id) >= 32:
+        return partial_id
+    data = api_get("/datasets", limit=0)
+    matches = [d["dataset_id"] for d in data["datasets"] if d["dataset_id"].startswith(partial_id)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        console.print(f"[red]Ambiguous ID prefix '{partial_id}' matches {len(matches)} datasets.[/red]")
+        sys.exit(1)
+    return partial_id  # let the server 404 with a clear error
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="EEG Dataset Server client - upload, view, and manage datasets.")
+    p.add_argument("--server", default=SERVER_URL, help=f"Server URL (default: {SERVER_URL})")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    up = sub.add_parser("upload", help="Upload a file and display its parsed report")
+    up.add_argument("filepath", nargs="?", default=FILE_PATH, help="Path to the file (defaults to configured FILE_PATH)")
+    up.set_defaults(func=cmd_upload)
+
+    ls = sub.add_parser("list", help="List datasets, with optional search/filter/sort")
+    ls.add_argument("--search", help="Filter by filename substring")
+    ls.add_argument("--format", choices=["csv", "tsv", "edf", "npy", "json"])
+    ls.add_argument("--status", choices=["ok", "error"])
+    ls.add_argument("--sort", default="uploaded_at", choices=["uploaded_at", "file_size_bytes", "original_filename"])
+    ls.add_argument("--order", default="desc", choices=["asc", "desc"])
+    ls.add_argument("--limit", type=int, default=0)
+    ls.add_argument("--offset", type=int, default=0)
+    ls.set_defaults(func=cmd_list)
+
+    vw = sub.add_parser("view", help="Show the full report for one dataset")
+    vw.add_argument("dataset_id", help="Full dataset ID or unique 8-char prefix")
+    vw.set_defaults(func=cmd_view)
+
+    dl = sub.add_parser("download", help="Download the original file for a dataset")
+    dl.add_argument("dataset_id")
+    dl.add_argument("-o", "--output", help="Output filename (default: original filename)")
+    dl.set_defaults(func=cmd_download)
+
+    rn = sub.add_parser("rename", help="Rename a dataset's display filename")
+    rn.add_argument("dataset_id")
+    rn.add_argument("new_name")
+    rn.set_defaults(func=cmd_rename)
+
+    de = sub.add_parser("delete", help="Delete one dataset")
+    de.add_argument("dataset_id")
+    de.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    de.set_defaults(func=cmd_delete)
+
+    da = sub.add_parser("delete-all", help="Delete ALL datasets (destructive)")
+    da.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    da.set_defaults(func=cmd_delete_all)
+
+    st = sub.add_parser("stats", help="Show aggregate server/storage stats")
+    st.set_defaults(func=cmd_stats)
+
+    return p
+
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    SERVER_URL = args.server  # allow overriding the configured server for this run
+    args.func(args)
