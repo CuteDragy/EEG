@@ -377,7 +377,7 @@ def resolve_id(partial_id: str) -> str:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="EEG Dataset Server client - upload, view, and manage datasets.")
     p.add_argument("--server", default=SERVER_URL, help=f"Server URL (default: {SERVER_URL})")
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=False)
 
     up = sub.add_parser("upload", help="Upload a file and display its parsed report")
     up.add_argument("filepath", nargs="?", default=FILE_PATH, help="Path to the file (defaults to configured FILE_PATH)")
@@ -426,4 +426,9 @@ if __name__ == "__main__":
     parser = build_arg_parser()
     args = parser.parse_args()
     SERVER_URL = args.server  # allow overriding the configured server for this run
-    args.func(args)
+    if args.command is None:
+        # No subcommand given (e.g. run via IDE "Run" button) -> old default behavior:
+        # upload the configured FILE_PATH and display its report.
+        cmd_upload(argparse.Namespace(filepath=FILE_PATH))
+    else:
+        args.func(args)
