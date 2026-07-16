@@ -332,8 +332,7 @@ info.format %}
         <tr>
           <td>Channels</td>
           <td>
-            {{ info.mne.n_channels }} ({{ info.mne.ch_types_guess_summary |
-            dict_items | map('reverse') | map('join', ' ') | join(', ') }})
+            {{ info.mne.n_channels }} ({{ info.mne.ch_types_guess_summary | format_channel_types }})</td>
           </td>
         </tr>
         <tr>
@@ -389,8 +388,7 @@ info.format %}
         <tr>
           <td>Event ID map</td>
           <td>
-            {{ info.mne.annotations.events_from_annotations.event_id_map |
-            dict_items | map('join', '=') | join(', ') }}
+            {{ info.mne.annotations.events_from_annotations.event_id_map | format_event_id_map }}</td>
           </td>
         </tr>
         {% endif %}

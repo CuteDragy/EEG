@@ -120,6 +120,20 @@ def datetime_format(value):
     except:
         return value
 
+@app.template_filter('format_channel_types')
+def format_channel_types(d):
+    """Convert a dict like {'eeg': 32, 'eog': 2} to 'eeg: 32, eog: 2'."""
+    if not d:
+        return ""
+    return ", ".join(f"{k}: {v}" for k, v in d.items())
+
+@app.template_filter('format_event_id_map')
+def format_event_id_map(d):
+    """Convert event_id_map dict to 'label1=1, label2=2'."""
+    if not d:
+        return ""
+    return ", ".join(f"{k}={v}" for k, v in d.items())
+
 # --------------------------------------------------------------------------
 # Logging - verbose debug logging as requested
 # --------------------------------------------------------------------------
