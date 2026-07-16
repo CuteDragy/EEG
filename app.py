@@ -41,6 +41,7 @@ Endpoints:
     GET    /datasets                      -> list datasets (search/filter/sort/paginate)
     GET    /datasets/<dataset_id>         -> full info for one dataset
     GET    /datasets/<dataset_id>/view    -> HTML detail page for one dataset
+    GET    /datasets/<dataset_id>/channel/<idx> -> signal data for channel idx (EDF only)
     PATCH  /datasets/<dataset_id>         -> rename a dataset's display filename
     DELETE /datasets/<dataset_id>         -> remove a dataset record + file
     DELETE /datasets                      -> bulk delete (?ids=a,b,c or ?confirm=true for all)
@@ -969,6 +970,75 @@ def view_dataset(dataset_id):
     return render_template("detail.html", dataset=ds, active="dashboard")
 
 
+@app.route("/datasets/<dataset_id>/channel/<int:channel_idx>", methods=["GET"])
+def get_channel_data(dataset_id, channel_idx):
+    """
+    Returns time-series and FFT for a specific channel of an EDF dataset.
+    Query params:
+      ?mode=time   -> return the raw time series (decimated if needed)
+      ?mode=fft    -> return frequency and magnitude arrays
+      ?mode=both   -> return both (default)
+      ?max_points=1000  -> limit the number of points (for time series)
+      ?max_freq=50      -> limit FFT frequency range (default: Nyquist)
+    """
+    ds = DATASETS.get(dataset_id)
+    if ds is None:
+        return jsonify({"error": "Dataset not found"}), 404
+    if ds["extension"] != "edf":
+        return jsonify({"error": "Only EDF files support channel data right now"}), 400
+
+    filepath = os.path.join(app.config["UPLOAD_FOLDER"], ds["stored_filename"])
+    if not os.path.exists(filepath):
+        gridfs_restore_to_disk(ds.get("gridfs_file_id"), filepath)
+    if not os.path.exists(filepath):
+        return jsonify({"error": "File not found"}), 410
+
+    try:
+        import mne
+        raw = mne.io.read_raw_edf(filepath, preload=True, verbose="ERROR")
+        sfreq = raw.info["sfreq"]
+        if channel_idx < 0 or channel_idx >= len(raw.ch_names):
+            return jsonify({"error": "Channel index out of range"}), 400
+        data, times = raw[channel_idx, :]
+        data = data.flatten()
+        ch_name = raw.ch_names[channel_idx]
+    except Exception as e:
+        return jsonify({"error": f"Failed to read EDF data: {str(e)}"}), 500
+
+    mode = request.args.get("mode", "both")
+    max_points = int(request.args.get("max_points", 1000))
+    max_freq = float(request.args.get("max_freq", sfreq/2))
+
+    response = {
+        "channel_name": ch_name,
+        "sfreq": sfreq,
+        "n_samples": len(data),
+        "duration_seconds": len(data) / sfreq,
+    }
+
+    if mode in ("time", "both"):
+        # Decimate if too many points
+        step = max(1, len(data) // max_points)
+        decimated_data = data[::step]
+        decimated_times = times[::step]
+        response["time"] = {
+            "times": decimated_times.tolist(),
+            "values": decimated_data.tolist(),
+        }
+
+    if mode in ("fft", "both"):
+        fft_vals = np.fft.rfft(data)
+        freqs = np.fft.rfftfreq(len(data), d=1/sfreq)
+        magnitude = np.abs(fft_vals)
+        idx = freqs <= max_freq
+        response["fft"] = {
+            "frequencies": freqs[idx].tolist(),
+            "magnitude": magnitude[idx].tolist(),
+        }
+
+    return jsonify(response)
+
+
 @app.route("/datasets/<dataset_id>", methods=["DELETE"])
 def delete_dataset(dataset_id):
     ds = DATASETS.pop(dataset_id, None)
@@ -1120,7 +1190,5 @@ def upload_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 0))
     debug_mode = os.environ.get("FLASK_DEBUG", "true").lower() in ("1", "true", "yes")
-    logger.info("Starting EEG dataset server on http://0.0.0.0:0", port)
-    # use_reloader=False: avoids the file watcher scanning the whole
-    # environment (e.g. site-packages) on every change in dev containers.
+    logger.info("Starting EEG dataset server on http://0.0.0.0:%s", port or 5000)
     app.run(host="0.0.0.0", port=port, debug=debug_mode, use_reloader=False)

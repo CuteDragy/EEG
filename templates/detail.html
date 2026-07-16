@@ -410,18 +410,64 @@ info.format %}
   </div>
   {% endif %}
 </div>
+{% endif %}
+
+<!-- Signal Viewer Section (only for EDF) -->
+{% if fmt == 'edf' %}
+<div
+  style="margin-top: 2rem; border-top: 1px solid #262a35; padding-top: 1.5rem"
+>
+  <h3 style="color: #7dd3fc">📊 Signal Viewer</h3>
+  <div
+    style="
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 1rem;
+    "
+  >
+    <label style="color: #94a3b8">Channel:</label>
+    <select
+      id="channelSelect"
+      style="
+        background: #161923;
+        border: 1px solid #262a35;
+        color: #e6e6e6;
+        padding: 0.4rem 0.8rem;
+        border-radius: 6px;
+      "
+    >
+      <!-- populated by JavaScript -->
+    </select>
+    <button
+      id="loadSignalBtn"
+      class="btn-primary"
+      style="
+        background: #164e63;
+        color: #7dd3fc;
+        border: none;
+        padding: 0.4rem 1rem;
+        border-radius: 6px;
+        cursor: pointer;
+      "
+    >
+      Load
+    </button>
+  </div>
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem">
+    <div class="panel">
+      <div class="panel-title">Time Domain</div>
+      <canvas id="timeChart" height="200"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Frequency Spectrum</div>
+      <canvas id="fftChart" height="200"></canvas>
+    </div>
+  </div>
+</div>
 {% endif %} {% endif %}
 <!-- end parse_status ok -->
-
-<script>
-  function deleteDataset(id) {
-    if (!confirm("Delete this dataset? This removes the file and its record."))
-      return;
-    fetch("/datasets/" + id, { method: "DELETE" }).then(
-      () => (window.location.href = "/"),
-    );
-  }
-</script>
 
 <style>
   .metric-card {
@@ -475,4 +521,123 @@ info.format %}
     border-bottom: none;
   }
 </style>
-{% endblock %}
+
+<script>
+  function deleteDataset(id) {
+    if (!confirm("Delete this dataset? This removes the file and its record."))
+      return;
+    fetch("/datasets/" + id, { method: "DELETE" }).then(
+      () => (window.location.href = "/"),
+    );
+  }
+</script>
+
+{% block scripts %} {% if dataset.parse_status == 'ok' and dataset.info.format
+== 'edf' %}
+<!-- include Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    const datasetId = '{{ dataset.dataset_id }}';
+    const info = {{ dataset.info|tojson }};
+    const channels = info.channels || [];
+
+    const select = document.getElementById('channelSelect');
+    channels.forEach((ch, idx) => {
+      const option = document.createElement('option');
+      option.value = idx;
+      option.textContent = ch.label || `Channel ${idx}`;
+      select.appendChild(option);
+    });
+
+    let timeChartInstance = null;
+    let fftChartInstance = null;
+
+    document.getElementById('loadSignalBtn').addEventListener('click', function() {
+      const idx = parseInt(select.value);
+      if (isNaN(idx)) return;
+
+      fetch(`/datasets/${datasetId}/channel/${idx}?mode=both&max_points=1500&max_freq=50`)
+        .then(res => res.json())
+        .then(data => {
+          // Time chart
+          const ctxTime = document.getElementById('timeChart').getContext('2d');
+          if (timeChartInstance) timeChartInstance.destroy();
+          timeChartInstance = new Chart(ctxTime, {
+            type: 'line',
+            data: {
+              labels: data.time.times,
+              datasets: [{
+                label: data.channel_name,
+                data: data.time.values,
+                borderColor: '#7dd3fc',
+                backgroundColor: 'rgba(125, 211, 252, 0.1)',
+                borderWidth: 1,
+                pointRadius: 0,
+              }]
+            },
+            options: {
+              responsive: true,
+              plugins: {
+                legend: { labels: { color: '#94a3b8' } }
+              },
+              scales: {
+                x: {
+                  title: { display: true, text: 'Time (s)', color: '#94a3b8' },
+                  ticks: { color: '#94a3b8' },
+                  grid: { color: '#262a35' }
+                },
+                y: {
+                  title: { display: true, text: 'Amplitude (µV)', color: '#94a3b8' },
+                  ticks: { color: '#94a3b8' },
+                  grid: { color: '#262a35' }
+                }
+              }
+            }
+          });
+
+          // FFT chart
+          const ctxFft = document.getElementById('fftChart').getContext('2d');
+          if (fftChartInstance) fftChartInstance.destroy();
+          fftChartInstance = new Chart(ctxFft, {
+            type: 'line',
+            data: {
+              labels: data.fft.frequencies,
+              datasets: [{
+                label: 'Magnitude',
+                data: data.fft.magnitude,
+                borderColor: '#fcd34d',
+                backgroundColor: 'rgba(252, 211, 77, 0.1)',
+                borderWidth: 1,
+                pointRadius: 0,
+                fill: true,
+              }]
+            },
+            options: {
+              responsive: true,
+              plugins: {
+                legend: { labels: { color: '#94a3b8' } }
+              },
+              scales: {
+                x: {
+                  title: { display: true, text: 'Frequency (Hz)', color: '#94a3b8' },
+                  ticks: { color: '#94a3b8' },
+                  grid: { color: '#262a35' }
+                },
+                y: {
+                  title: { display: true, text: 'Magnitude', color: '#94a3b8' },
+                  ticks: { color: '#94a3b8' },
+                  grid: { color: '#262a35' },
+                  beginAtZero: true,
+                }
+              }
+            }
+          });
+        })
+        .catch(err => {
+          alert('Failed to load signal: ' + err.message);
+        });
+    });
+  });
+</script>
+{% endif %} {% endblock %} {% endblock %}

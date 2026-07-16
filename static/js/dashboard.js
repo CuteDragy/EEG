@@ -69,4 +69,4 @@ document
   .addEventListener("change", () => load());
 
 load();
-setInterval(load, 10000); // auto-refresh every 10s
+setInterval(load, 10000);
