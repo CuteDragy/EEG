@@ -12,7 +12,7 @@ from rich import box
 
 # ── Config ───────────────────────────────────────────────────────────────────
 SERVER_URL = "https://eeg-a37i.onrender.com"
-FILE_PATH  = r"C:\Users\pzhiy\OneDrive - University of Nottingham Malaysia\Files\Internship\Summer25-26\EEG\uploads\S001R01.edf"
+FILE_PATH  = r"C:\Users\pzhiy\OneDrive - University of Nottingham Malaysia\Files\Internship\Summer25-26\EEG\uploads\S001R02.edf"
 # ─────────────────────────────────────────────────────────────────────────────
 
 console = Console()

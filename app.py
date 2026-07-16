@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, render_template
 from werkzeug.utils import secure_filename
 
 try:
@@ -1084,131 +1084,18 @@ def not_found(e):
 
 @app.route("/", methods=["GET"])
 def dashboard():
-    return """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>EEG Dataset Server</title>
-<style>
-  body { font-family: -apple-system, Segoe UI, sans-serif; background:#0f1117; color:#e6e6e6; margin:0; padding:2rem; }
-  h1 { color:#7dd3fc; }
-  .status { display:inline-block; padding:.25rem .75rem; border-radius:999px; font-size:.85rem; margin-bottom:1.5rem; }
-  .ok { background:#14532d; color:#86efac; }
-  .bad { background:#7f1d1d; color:#fca5a5; }
-  table { width:100%; border-collapse:collapse; margin-top:1rem; }
-  th, td { text-align:left; padding:.6rem .8rem; border-bottom:1px solid #262a35; font-size:.9rem; }
-  th { color:#94a3b8; font-weight:600; }
-  tr:hover { background:#1a1d27; }
-  .pill { padding:.15rem .5rem; border-radius:6px; font-size:.75rem; }
-  .success { background:#14532d; color:#86efac; }
-  .error { background:#7f1d1d; color:#fca5a5; }
-  .empty { color:#64748b; padding:2rem 0; text-align:center; }
-  a { color:#7dd3fc; }
-</style>
-</head>
-<body>
-  <h1>🧠 EEG Dataset Server</h1>
-  <span id="statusPill" class="status">checking…</span>
-  <div id="counts" style="color:#94a3b8; margin-bottom:1rem;"></div>
+    return render_template("index.html", active="dashboard")
 
-  <div style="display:flex; gap:.5rem; margin-bottom:1rem; flex-wrap:wrap;">
-    <input id="searchBox" placeholder="Search filename…" style="flex:1; min-width:180px; background:#161923; border:1px solid #262a35; color:#e6e6e6; padding:.5rem .75rem; border-radius:6px;">
-    <select id="formatFilter" style="background:#161923; border:1px solid #262a35; color:#e6e6e6; padding:.5rem .75rem; border-radius:6px;">
-      <option value="">All formats</option>
-      <option value="edf">EDF</option>
-      <option value="csv">CSV</option>
-      <option value="tsv">TSV</option>
-      <option value="npy">NPY</option>
-      <option value="json">JSON</option>
-    </select>
-    <button id="deleteAllBtn" style="background:#7f1d1d; color:#fca5a5; border:none; padding:.5rem 1rem; border-radius:6px; cursor:pointer;">Delete all</button>
-  </div>
 
-  <table>
-    <thead>
-      <tr><th>Filename</th><th>Format</th><th>Size</th><th>Uploaded</th><th>Status</th><th></th></tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <div id="emptyMsg" class="empty" style="display:none;">No datasets found.</div>
+@app.route("/upload-page", methods=["GET"])
+def upload_page():
+    return render_template("upload.html", active="upload")
 
-<script>
-async function load() {
-  try {
-    const health = await (await fetch("/health")).json();
-    const pill = document.getElementById("statusPill");
-    pill.textContent = health.mongo_connected ? "● online (db connected)" : "● online (in-memory only)";
-    pill.className = "status " + (health.mongo_connected ? "ok" : "bad");
-
-    const search = document.getElementById("searchBox").value.trim();
-    const format = document.getElementById("formatFilter").value;
-    const params = new URLSearchParams();
-    if (search) params.set("search", search);
-    if (format) params.set("format", format);
-
-    const data = await (await fetch("/datasets?" + params.toString())).json();
-    document.getElementById("counts").textContent =
-      `${data.total_matched} of ${data.total} dataset(s) shown`;
-
-    const rows = document.getElementById("rows");
-    const emptyMsg = document.getElementById("emptyMsg");
-    rows.innerHTML = "";
-
-    if (!data.datasets.length) {
-      emptyMsg.style.display = "block";
-      return;
-    }
-    emptyMsg.style.display = "none";
-
-    data.datasets.forEach(ds => {
-      const mb = (ds.file_size_bytes / (1024*1024)).toFixed(2);
-      const statusClass = ds.parse_status === "ok" ? "success" : "error";
-      rows.innerHTML += `
-        <tr>
-          <td><a href="/datasets/${ds.dataset_id}">${ds.original_filename}</a></td>
-          <td>${ds.extension.toUpperCase()}</td>
-          <td>${mb} MB</td>
-          <td>${new Date(ds.uploaded_at).toLocaleString()}</td>
-          <td><span class="pill ${statusClass}">${ds.parse_status}</span></td>
-          <td style="white-space:nowrap;">
-            <a href="/datasets/${ds.dataset_id}/download" style="margin-right:.75rem;">↓</a>
-            <a href="#" onclick="removeDataset('${ds.dataset_id}'); return false;" style="color:#fca5a5;">✕</a>
-          </td>
-        </tr>`;
-    });
-  } catch (e) {
-    document.getElementById("statusPill").textContent = "● error loading status";
-    document.getElementById("statusPill").className = "status bad";
-  }
-}
-
-async function removeDataset(id) {
-  if (!confirm("Delete this dataset? This removes the file and its record.")) return;
-  await fetch(`/datasets/${id}`, { method: "DELETE" });
-  load();
-}
-
-document.getElementById("deleteAllBtn").addEventListener("click", async () => {
-  if (!confirm("Delete ALL datasets? This cannot be undone.")) return;
-  await fetch("/datasets?confirm=true", { method: "DELETE" });
-  load();
-});
-
-document.getElementById("searchBox").addEventListener("input", () => load());
-document.getElementById("formatFilter").addEventListener("change", () => load());
-
-load();
-setInterval(load, 10000); // auto-refresh every 10s
-</script>
-</body>
-</html>
-"""
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 0))
     debug_mode = os.environ.get("FLASK_DEBUG", "true").lower() in ("1", "true", "yes")
-    logger.info("Starting EEG dataset server on http://0.0.0.0:%s", port)
+    logger.info("Starting EEG dataset server on http://0.0.0.0:0", port)
     # use_reloader=False: avoids the file watcher scanning the whole
     # environment (e.g. site-packages) on every change in dev containers.
     app.run(host="0.0.0.0", port=port, debug=debug_mode, use_reloader=False)
