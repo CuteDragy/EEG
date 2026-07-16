@@ -2,7 +2,9 @@ async function load() {
   try {
     const health = await (await fetch("/health")).json();
     const pill = document.getElementById("statusPill");
-    pill.textContent = health.mongo_connected ? "● online (db connected)" : "● online (in-memory only)";
+    pill.textContent = health.mongo_connected
+      ? "● online (db connected)"
+      : "● online (in-memory only)";
     pill.className = "status " + (health.mongo_connected ? "ok" : "bad");
 
     const search = document.getElementById("searchBox").value.trim();
@@ -25,12 +27,12 @@ async function load() {
     }
     emptyMsg.style.display = "none";
 
-    data.datasets.forEach(ds => {
+    data.datasets.forEach((ds) => {
       const mb = (ds.file_size_bytes / (1024 * 1024)).toFixed(2);
       const statusClass = ds.parse_status === "ok" ? "success" : "error";
       rows.innerHTML += `
         <tr>
-          <td><a href="/datasets/${ds.dataset_id}">${ds.original_filename}</a></td>
+          <td><a href="/datasets/${ds.dataset_id}/view">${ds.original_filename}</a></td>
           <td>${ds.extension.toUpperCase()}</td>
           <td>${mb} MB</td>
           <td>${new Date(ds.uploaded_at).toLocaleString()}</td>
@@ -42,13 +44,15 @@ async function load() {
         </tr>`;
     });
   } catch (e) {
-    document.getElementById("statusPill").textContent = "● error loading status";
+    document.getElementById("statusPill").textContent =
+      "● error loading status";
     document.getElementById("statusPill").className = "status bad";
   }
 }
 
 async function removeDataset(id) {
-  if (!confirm("Delete this dataset? This removes the file and its record.")) return;
+  if (!confirm("Delete this dataset? This removes the file and its record."))
+    return;
   await fetch(`/datasets/${id}`, { method: "DELETE" });
   load();
 }
@@ -60,7 +64,9 @@ document.getElementById("deleteAllBtn").addEventListener("click", async () => {
 });
 
 document.getElementById("searchBox").addEventListener("input", () => load());
-document.getElementById("formatFilter").addEventListener("change", () => load());
+document
+  .getElementById("formatFilter")
+  .addEventListener("change", () => load());
 
 load();
 setInterval(load, 10000); // auto-refresh every 10s

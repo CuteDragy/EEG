@@ -40,6 +40,7 @@ Endpoints:
     POST   /upload                        -> upload a dataset file, returns parsed info
     GET    /datasets                      -> list datasets (search/filter/sort/paginate)
     GET    /datasets/<dataset_id>         -> full info for one dataset
+    GET    /datasets/<dataset_id>/view    -> HTML detail page for one dataset
     PATCH  /datasets/<dataset_id>         -> rename a dataset's display filename
     DELETE /datasets/<dataset_id>         -> remove a dataset record + file
     DELETE /datasets                      -> bulk delete (?ids=a,b,c or ?confirm=true for all)
@@ -67,7 +68,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request, send_file, render_template
+from flask import Flask, jsonify, request, send_file, render_template, abort
 from werkzeug.utils import secure_filename
 
 try:
@@ -103,6 +104,20 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+
+# --------------------------------------------------------------------------
+# Custom Jinja2 filter for datetime formatting
+# --------------------------------------------------------------------------
+
+@app.template_filter('datetime_format')
+def datetime_format(value):
+    if value is None:
+        return ''
+    try:
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return dt.strftime('%Y-%m-%d %H:%M')
+    except:
+        return value
 
 # --------------------------------------------------------------------------
 # Logging - verbose debug logging as requested
@@ -945,6 +960,15 @@ def get_dataset(dataset_id):
     return jsonify(ds), 200
 
 
+@app.route("/datasets/<dataset_id>/view", methods=["GET"])
+def view_dataset(dataset_id):
+    """Render a professional detail page for a dataset."""
+    ds = DATASETS.get(dataset_id)
+    if ds is None:
+        abort(404)
+    return render_template("detail.html", dataset=ds, active="dashboard")
+
+
 @app.route("/datasets/<dataset_id>", methods=["DELETE"])
 def delete_dataset(dataset_id):
     ds = DATASETS.pop(dataset_id, None)
@@ -1080,7 +1104,8 @@ def too_large(e):
 
 @app.errorhandler(404)
 def not_found(e):
-    return jsonify({"error": "Endpoint not found"}), 404
+    return render_template("404.html"), 404
+
 
 @app.route("/", methods=["GET"])
 def dashboard():
