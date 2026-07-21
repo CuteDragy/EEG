@@ -1,0 +1,7 @@
+{
+  "montage_name": "Standard 10-20 System (Subset)",
+  "custom_channels": [
+    "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8", "T3", "C3", "Cz",
+    "Pz", "O1", "O2" 
+  ]
+}
