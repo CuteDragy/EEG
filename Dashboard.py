@@ -1,9 +1,20 @@
 """
-EEG Dataset Upload Server
-==========================
-A Flask REST API that accepts EEG dataset uploads and returns structural
-debug/info metadata about them. No signal analysis is performed - this
-service is purely for ingesting, validating, and inspecting datasets.
+EEG Dataset Upload Server + Live Monitoring Dashboard
+=======================================================
+A Flask app with two halves:
+
+1. A REST API that accepts EEG dataset uploads and returns structural
+   debug/info metadata about them (no signal analysis - purely ingesting,
+   validating, and inspecting datasets). See the endpoint list below.
+
+2. A live EEG monitoring dashboard at /live (ported from the original
+   Streamlit app.py) that reads raw EEG-chunk documents from MongoDB
+   (falling back to generated mock data), and renders a live-sweeping
+   multichannel signal chart, per-band topographic maps, and a
+   downloadable session report with band-power analysis. This half DOES
+   perform signal analysis (band-pass filtering for band power, montage-
+   based topomaps) - it is deliberately separate from the upload API above,
+   which stays analysis-free.
 
 Supported formats:
   - .csv / .tsv   (rows = samples, columns = channels, optional time column)
@@ -48,6 +59,19 @@ Endpoints:
     GET    /datasets/<dataset_id>/download -> download the original uploaded file
     POST   /datasets/<dataset_id>/reparse  -> re-run parsing with new query-param opts
 
+    GET    /live                           -> live EEG monitoring dashboard (HTML page)
+    GET    /live/report.txt                -> download the session report as text
+    GET    /live/api/topomap/<band>.png    -> live topographic-map image for one band
+                                               (band = Delta|Theta|Alpha|Beta|Gamma|Broadband)
+
+    /live query params (all optional, combinable):
+      ?source=auto|mongo|mock   data source (default: auto)
+      ?n_channels=64            channel count for mock data (4-256, default 64)
+      ?sfreq=160                sampling rate (Hz) for mock data (32-1024, default 160)
+      ?regions=Frontal,Central  comma-separated brain regions to display (default: all)
+      ?window_sec=6             sweep/analysis window in seconds (2-15, default 6)
+      ?topo_refresh=1.0         topomap refresh interval in seconds (0.5-3.0, default 1.0)
+
     /datasets query params (all optional, combinable):
       ?search=name       case-insensitive filename substring match
       ?format=edf        filter by extension (csv/tsv/edf/npy/json)
@@ -61,15 +85,17 @@ import io
 import json
 import logging
 import os
+import string
 import struct
 import time
 import traceback
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request, send_file, render_template, abort
+from flask import Flask, jsonify, request, send_file, render_template, abort, Response
 from werkzeug.utils import secure_filename
 
 try:
@@ -783,6 +809,295 @@ PARSERS = {
 }
 
 
+# ==========================================================================
+# LIVE EEG MONITORING DASHBOARD  (merged in from the Streamlit app.py)
+# ==========================================================================
+# Ports every feature of the original Streamlit dashboard onto Flask routes
+# under /live: MongoDB/mock data source selection, region filtering, a
+# live-sweeping multichannel signal chart (HTML5 canvas), per-band
+# topographic maps, and a downloadable session report. Flask has no
+# built-in rerun-on-interaction like Streamlit, so the sidebar controls are
+# a plain <form method="GET"> that reloads /live with new query params; the
+# sweep chart animates client-side and the topomaps refresh themselves via
+# a periodic image reload - both driven by requestAnimationFrame/JS timers.
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    plt = None
+    MATPLOTLIB_AVAILABLE = False
+
+try:
+    from scipy.signal import decimate as _scipy_decimate
+    SCIPY_AVAILABLE = True
+except ImportError:
+    _scipy_decimate = None
+    SCIPY_AVAILABLE = False
+
+import threading
+from functools import lru_cache
+from io import BytesIO
+
+LIVE_BANDS = {"Delta": (0.5, 4), "Theta": (4, 8), "Alpha": (8, 13), "Beta": (13, 30), "Gamma": (30, 45)}
+LIVE_BAND_ORDER = ["Delta", "Theta", "Alpha", "Beta", "Gamma", "Broadband"]
+LIVE_BAND_DESCRIPTIONS = {
+    "Delta": "slow, high-amplitude activity generally associated with deep rest or drowsiness",
+    "Theta": "activity often linked to a light, meditative, or drowsy state",
+    "Alpha": "activity generally associated with a calm, relaxed, eyes-closed-type state",
+    "Beta": "activity often associated with active thinking, alertness, or mild tension",
+    "Gamma": "activity sometimes linked to high-level cognitive processing or focus",
+}
+LIVE_CANVAS_POINT_BUDGET = 3000
+LIVE_REGION_ORDER = ["Frontal", "Central", "Temporal", "Parietal", "Occipital", "Other"]
+
+# Guessed field names for raw EEG-chunk documents. These live in the same
+# MongoDB collection as the dataset registry above, and are distinguished
+# from parsed-upload metadata records by having one of LIVE_DATA_KEYS.
+LIVE_CHANNEL_KEYS = ["channels", "channel_names", "ch_names"]
+LIVE_SFREQ_KEYS = ["sampling_rate", "sfreq", "fs", "sample_rate"]
+LIVE_DATA_KEYS = ["data", "eeg_data", "samples", "values"]
+LIVE_ORDER_KEYS = ["chunk_index", "sequence", "sequence_index", "part", "part_number", "order"]
+
+_live_docs_cache = {"docs": None, "ts": 0.0}
+_live_cache_lock = threading.Lock()
+
+LIVE_STATS_LOCK = threading.Lock()
+LIVE_STATS = {"session_start": time.time(), "refresh_count": 0, "regions_seen": set()}
+
+
+def _live_first_present(doc, candidate_keys):
+    for k in candidate_keys:
+        if k in doc and doc[k] is not None:
+            return doc[k]
+    return None
+
+
+def fetch_live_documents(ttl=30):
+    """Pull raw EEG-chunk documents from the shared MongoDB collection,
+    cached for `ttl` seconds (mirrors app.py's @st.cache_data(ttl=30))."""
+    if not MONGO_CONNECTED:
+        return None
+    with _live_cache_lock:
+        if _live_docs_cache["docs"] is not None and (time.time() - _live_docs_cache["ts"]) < ttl:
+            return _live_docs_cache["docs"]
+    docs = None
+    try:
+        query = {"$or": [{k: {"$exists": True}} for k in LIVE_DATA_KEYS]}
+        docs = list(mongo_collection.find(query))
+    except PyMongoError as e:
+        logger.error("Live dashboard: MongoDB fetch failed: %s", e)
+    with _live_cache_lock:
+        _live_docs_cache["docs"] = docs if docs else None
+        _live_docs_cache["ts"] = time.time()
+    return _live_docs_cache["docs"]
+
+
+def build_live_raw_from_documents(docs):
+    """Stitches raw EEG-chunk documents into one continuous (channels,
+    samples) array in sequence - ported directly from app.py."""
+    if not docs:
+        return None, None, None, 0
+
+    def sort_key(d):
+        for k in LIVE_ORDER_KEYS:
+            if k in d:
+                return d[k]
+        return d.get("_id")
+
+    docs = sorted(docs, key=sort_key)
+
+    ch_names, sfreq, chunks = None, None, []
+    for d in docs:
+        names = _live_first_present(d, LIVE_CHANNEL_KEYS)
+        fs = _live_first_present(d, LIVE_SFREQ_KEYS)
+        raw_vals = _live_first_present(d, LIVE_DATA_KEYS)
+        if raw_vals is None:
+            continue
+        arr = np.array(raw_vals, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if names and arr.shape[0] != len(names) and arr.ndim == 2 and arr.shape[1] == len(names):
+            arr = arr.T
+        chunks.append(arr)
+        ch_names = ch_names or names
+        sfreq = sfreq or fs
+
+    if not chunks or ch_names is None or sfreq is None:
+        return None, None, None, 0
+
+    try:
+        full = np.concatenate(chunks, axis=1)
+    except ValueError:
+        min_ch = min(c.shape[0] for c in chunks)
+        full = np.concatenate([c[:min_ch] for c in chunks], axis=1)
+        ch_names = ch_names[:min_ch]
+
+    return full, list(ch_names), float(sfreq), len(chunks)
+
+
+@lru_cache(maxsize=4)
+def get_live_fallback_pool():
+    return tuple(mne.channels.make_standard_montage("standard_1005").ch_names)
+
+
+def pick_live_channel_names(n_channels):
+    exact = {16: "biosemi16", 32: "biosemi32", 64: "biosemi64"}
+    if n_channels in exact:
+        return list(mne.channels.make_standard_montage(exact[n_channels]).ch_names)
+    pool = list(get_live_fallback_pool())
+    if n_channels <= len(pool):
+        return pool[:n_channels]
+    return pool + [f"CH{i}" for i in range(len(pool), n_channels)]
+
+
+def classify_live_region(ch):
+    c = ch.upper()
+    if c.startswith("FP") or c.startswith("AF"):
+        return "Frontal"
+    if c.startswith("FC"):
+        return "Central"
+    if c.startswith("FT"):
+        return "Temporal"
+    if c.startswith("F"):
+        return "Frontal"
+    if c.startswith("CP"):
+        return "Parietal"
+    if c.startswith("TP"):
+        return "Temporal"
+    if c.startswith("C"):
+        return "Central"
+    if c.startswith("PO"):
+        return "Occipital"
+    if c.startswith("P"):
+        return "Parietal"
+    if c.startswith("T"):
+        return "Temporal"
+    if c.startswith("O") or c == "IZ":
+        return "Occipital"
+    return "Other"
+
+
+@lru_cache(maxsize=4)
+def get_live_montage():
+    return mne.channels.make_standard_montage("standard_1005")
+
+
+@lru_cache(maxsize=16)
+def build_live_info(ch_names, sfreq):
+    info = mne.create_info(ch_names=list(ch_names), sfreq=sfreq, ch_types="eeg")
+    info.set_montage(get_live_montage(), on_missing="ignore")
+    return info
+
+
+@lru_cache(maxsize=16)
+def generate_mock_eeg(n_channels, sfreq, duration_sec=60):
+    ch_names = pick_live_channel_names(n_channels)
+    n_samples = duration_sec * sfreq
+    t = np.arange(n_samples) / sfreq
+    rng = np.random.default_rng(42)
+    data_uv = np.zeros((n_channels, n_samples))
+    for i in range(n_channels):
+        sig = np.zeros(n_samples)
+        for freq, base_amp in [(2, 8), (6, 5), (10, 6), (20, 3), (40, 2)]:
+            amp = base_amp * rng.uniform(0.1, 1.5)
+            sig += amp * np.sin(2 * np.pi * freq * t + rng.uniform(0, 2 * np.pi))
+        pink = np.cumsum(rng.normal(0, 1, n_samples))
+        pink = (pink - pink.mean()) / pink.std() * 4
+        data_uv[i] = sig + pink
+    return data_uv, tuple(ch_names), float(sfreq)
+
+
+def downsample_for_display(data_uv, target_points=LIVE_CANVAS_POINT_BUDGET):
+    """Anti-aliased downsample of a (channels, samples) uV array so the
+    browser payload stays bounded no matter how long the recording is."""
+    out = data_uv
+    if SCIPY_AVAILABLE:
+        while out.shape[1] > target_points * 2:
+            out = _scipy_decimate(out, 2, axis=1, zero_phase=True)
+    if out.shape[1] > target_points:
+        idx = np.linspace(0, out.shape[1] - 1, target_points).astype(int)
+        out = out[:, idx]
+    return out
+
+
+def live_band_power(chan_data_uv, sfreq, lo, hi):
+    min_sec = max(2.0, 3.0 / lo)
+    if chan_data_uv.shape[1] < min_sec * sfreq:
+        return None
+    filtered = mne.filter.filter_data(chan_data_uv, sfreq, lo, hi, verbose="ERROR")
+    return np.mean(filtered ** 2, axis=1)
+
+
+def resolve_live_dataset(args):
+    """Resolves (RAW_DATA volts, CH_NAMES, sfreq, meta) from query params,
+    mirroring app.py's sidebar data-source logic."""
+    source = args.get("source", "auto")
+    try:
+        n_channels = max(4, min(256, int(args.get("n_channels", 64))))
+    except (TypeError, ValueError):
+        n_channels = 64
+    try:
+        sfreq_mock = max(32, min(1024, int(args.get("sfreq", 160))))
+    except (TypeError, ValueError):
+        sfreq_mock = 160
+
+    docs = fetch_live_documents()
+    mongo_data, mongo_ch_names, mongo_sfreq, n_files = build_live_raw_from_documents(docs)
+    mongo_available = mongo_data is not None
+
+    use_mongo = mongo_available and source != "mock"
+    if source == "mongo" and not mongo_available:
+        use_mongo = False
+
+    meta = {
+        "n_files": n_files,
+        "mongo_available": mongo_available,
+        "source": "mongo" if use_mongo else "mock",
+        "n_channels_requested": n_channels,
+        "sfreq_requested": sfreq_mock,
+    }
+
+    if use_mongo:
+        raw_data = mongo_data * 1e-6 if np.nanmax(np.abs(mongo_data)) > 1 else mongo_data
+        ch_names = list(mongo_ch_names)
+        sfreq = float(mongo_sfreq)
+    else:
+        mock_uv, ch_names_t, sfreq = generate_mock_eeg(n_channels, sfreq_mock)
+        raw_data = mock_uv * 1e-6
+        ch_names = list(ch_names_t)
+
+    return raw_data, ch_names, sfreq, meta
+
+
+def live_window_params(args):
+    try:
+        window_sec = max(2, min(15, int(float(args.get("window_sec", 6)))))
+    except (TypeError, ValueError):
+        window_sec = 6
+    try:
+        topo_refresh = max(0.5, min(3.0, float(args.get("topo_refresh", 1.0))))
+    except (TypeError, ValueError):
+        topo_refresh = 1.0
+    return window_sec, topo_refresh
+
+
+def live_selected_channels(ch_names, regions_param):
+    region_map = {}
+    for ch in ch_names:
+        region_map.setdefault(classify_live_region(ch), []).append(ch)
+    region_options = [r for r in LIVE_REGION_ORDER if r in region_map]
+    if regions_param is None:
+        region_choice = list(region_options)
+    else:
+        requested = [r.strip() for r in regions_param.split(",") if r.strip()]
+        region_choice = [r for r in requested if r in region_options] or list(region_options)
+    selected = [ch for ch in ch_names if classify_live_region(ch) in region_choice] or ch_names
+    return region_options, region_choice, selected
+
+
 # --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
@@ -1174,6 +1489,478 @@ def reparse_dataset(dataset_id):
     status_code = 200 if not parse_error else 422
     logger.info("Reparsed dataset %s: status=%s", dataset_id, ds["parse_status"])
     return jsonify(ds), status_code
+
+
+def compute_live_context(args):
+    """Single source of truth for both the /live HTML page and the
+    /live/report.txt download - resolves the data source, applies the
+    control settings, and computes the session report numbers."""
+    raw_data, ch_names, sfreq, meta = resolve_live_dataset(args)
+    window_sec, topo_refresh = live_window_params(args)
+    region_options, region_choice, selected_channels = live_selected_channels(ch_names, args.get("regions"))
+
+    with LIVE_STATS_LOCK:
+        LIVE_STATS["refresh_count"] += 1
+        LIVE_STATS["regions_seen"] |= set(region_choice)
+        refresh_count = LIVE_STATS["refresh_count"]
+        session_minutes = (time.time() - LIVE_STATS["session_start"]) / 60
+        regions_seen_sorted = sorted(LIVE_STATS["regions_seen"])
+
+    total_samples = raw_data.shape[1]
+    fallback_pool = set(get_live_fallback_pool())
+    recognized = [ch for ch in ch_names if ch in fallback_pool]
+    custom_channels = [ch for ch in ch_names if ch not in fallback_pool]
+
+    sel_idx = [ch_names.index(ch) for ch in selected_channels]
+    display_data = downsample_for_display(raw_data[sel_idx])
+    display_sfreq = sfreq * display_data.shape[1] / raw_data.shape[1] if raw_data.shape[1] else sfreq
+    sweep_payload = {
+        "channels": selected_channels,
+        "windowSec": window_sec,
+        "dt": 1.0 / display_sfreq if display_sfreq else 1.0,
+        "data": display_data.tolist(),
+        "totalPoints": display_data.shape[1],
+    }
+
+    analysis_window = min(total_samples, int(min(60, total_samples / sfreq) * sfreq)) if sfreq else 0
+    report_data_uv = raw_data[:, -analysis_window:] * 1e6 if analysis_window > 0 else raw_data * 1e6
+
+    band_powers = {}
+    for band_name, (lo, hi) in LIVE_BANDS.items():
+        p = live_band_power(report_data_uv, sfreq, lo, hi) if MNE_AVAILABLE and sfreq else None
+        band_powers[band_name] = float(np.mean(p)) if p is not None else 0.0
+    total_power = sum(band_powers.values()) or 1.0
+    band_pct = {k: 100 * v / total_power for k, v in band_powers.items()}
+    dominant_band = max(band_pct, key=band_pct.get) if any(band_pct.values()) else None
+    recording_seconds = total_samples / sfreq if sfreq else 0
+
+    qs = urlencode({
+        "source": args.get("source", "auto"),
+        "n_channels": args.get("n_channels", 64),
+        "sfreq": args.get("sfreq", 160),
+        "regions": ",".join(region_choice),
+        "window_sec": window_sec,
+    })
+
+    return {
+        "meta": meta, "ch_names": ch_names, "sfreq": sfreq, "region_options": region_options,
+        "region_choice": region_choice, "selected_channels": selected_channels,
+        "sweep_payload": sweep_payload, "window_sec": window_sec, "topo_refresh": topo_refresh,
+        "recognized": recognized, "custom_channels": custom_channels, "band_pct": band_pct,
+        "dominant_band": dominant_band, "analysis_window": analysis_window,
+        "session_minutes": session_minutes, "recording_seconds": recording_seconds,
+        "regions_seen": regions_seen_sorted, "refresh_count": refresh_count, "qs": qs,
+        "args": args, "total_samples": total_samples,
+    }
+
+
+LIVE_PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EEG Monitoring Dashboard</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f7f8fa; color: #1a1a1a; }
+  header { padding: 18px 24px; background: #fff; border-bottom: 1px solid #e0e0e0; display: flex; align-items: center; justify-content: space-between; }
+  header h1 { font-size: 22px; margin: 0; }
+  header nav a { margin-left: 16px; color: #2563eb; text-decoration: none; font-size: 14px; }
+  .layout { display: flex; align-items: flex-start; }
+  .sidebar { width: 280px; flex-shrink: 0; background: #fff; border-right: 1px solid #e0e0e0; padding: 18px; min-height: 100vh; }
+  .sidebar h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: #666; margin: 18px 0 8px; }
+  .sidebar h3:first-child { margin-top: 0; }
+  .sidebar label { display: block; font-size: 13px; margin: 6px 0 3px; }
+  .sidebar select, .sidebar input[type=number] { width: 100%; padding: 5px 6px; margin-bottom: 8px; border: 1px solid #ccc; border-radius: 5px; }
+  .sidebar input[type=range] { width: 100%; }
+  .region-check { font-size: 13px; margin: 3px 0; }
+  .sidebar button { width: 100%; margin-top: 12px; padding: 8px; background: #2563eb; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  .main { flex: 1; padding: 20px 24px; }
+  .caption { color: #666; font-size: 13px; margin-bottom: 10px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; margin-right: 6px; }
+  .badge.ok { background: #dcfce7; color: #166534; }
+  .badge.warn { background: #fef3c7; color: #92400e; }
+  .columns { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
+  .col-chart { flex: 3; min-width: 360px; }
+  .col-topo { flex: 2; min-width: 300px; }
+  .card { background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+  .topo-grid img { width: 100%; max-width: 320px; display: block; margin: 0 auto 10px; }
+  .bar-row { display: flex; align-items: center; margin: 4px 0; font-size: 12px; }
+  .bar-label { width: 60px; }
+  .bar-track { flex: 1; background: #eee; border-radius: 4px; overflow: hidden; height: 14px; margin: 0 8px; }
+  .bar-fill { height: 100%; background: #2563eb; }
+  .bar-pct { width: 42px; text-align: right; }
+  .report-list { font-size: 13px; line-height: 1.7; }
+  .divider { border: none; border-top: 1px solid #e0e0e0; margin: 20px 0; }
+  a.download { display: inline-block; margin-top: 8px; padding: 7px 14px; background: #111827; color: #fff; border-radius: 6px; text-decoration: none; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>EEG Monitoring Dashboard</h1>
+  <nav><a href="/">Dataset manager</a><a href="/upload-page">Upload</a></nav>
+</header>
+<div class="layout">
+  <form class="sidebar" method="GET" action="/live">
+    <h3>Data Source</h3>
+    <label>Source</label>
+    <select name="source">
+      <option value="auto" $SEL_AUTO>Auto (MongoDB, fallback to mock)</option>
+      <option value="mongo" $SEL_MONGO>MongoDB only</option>
+      <option value="mock" $SEL_MOCK>Mock data only</option>
+    </select>
+    $MONGO_STATUS
+
+    <h3>Mock Data Settings</h3>
+    <label>Number of channels</label>
+    <input type="number" name="n_channels" min="4" max="256" value="$N_CHANNELS">
+    <label>Sampling rate (Hz)</label>
+    <input type="number" name="sfreq" min="32" max="1024" value="$SFREQ_MOCK">
+
+    <h3>Display Controls</h3>
+    <label>Sweep / analysis window (seconds): <span id="windowSecLabel">$WINDOW_SEC</span></label>
+    <input type="range" name="window_sec" min="2" max="15" value="$WINDOW_SEC"
+           oninput="document.getElementById('windowSecLabel').textContent = this.value">
+    <label>Topomap refresh interval (s): <span id="topoRefreshLabel">$TOPO_REFRESH</span></label>
+    <input type="range" name="topo_refresh" min="0.5" max="3.0" step="0.5" value="$TOPO_REFRESH"
+           oninput="document.getElementById('topoRefreshLabel').textContent = this.value">
+
+    <h3>Brain regions to display</h3>
+    $REGION_CHECKBOXES
+
+    <button type="submit">Apply</button>
+  </form>
+
+  <div class="main">
+    <div class="columns">
+      <div class="col-chart">
+        <div class="card">
+          <h3 style="margin-top:0">Live Multi-Channel EEG Signal</h3>
+          <div class="caption">$CHART_CAPTION</div>
+          <div style="background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:6px;">
+            <canvas id="eegCanvas" style="width:100%;display:block;"></canvas>
+          </div>
+        </div>
+      </div>
+      <div class="col-topo">
+        <div class="card topo-grid">
+          <h3 style="margin-top:0">Topographic Maps - All Bands</h3>
+          $TOPO_IMGS
+          $CUSTOM_CHANNELS_NOTE
+        </div>
+      </div>
+    </div>
+
+    <hr class="divider">
+
+    <h2>Session Report</h2>
+    <div class="columns">
+      <div class="card" style="flex:1; min-width:280px;">
+        <h3 style="margin-top:0">App usage</h3>
+        <div class="report-list">$REPORT_USAGE</div>
+      </div>
+      <div class="card" style="flex:1; min-width:280px;">
+        <h3 style="margin-top:0">Brainwave band mix <span style="font-weight:normal;font-size:12px;color:#666">(last $ANALYSIS_WINDOW_SEC s, selected channels)</span></h3>
+        $BAND_BARS
+      </div>
+    </div>
+    $DOMINANT_BAND_NOTE
+    <a class="download" href="/live/report.txt?$QS">Download report (.txt)</a>
+  </div>
+</div>
+
+<script>
+(function() {
+    const cfg = $SWEEP_JSON;
+    const channels = cfg.channels;
+    const windowSec = cfg.windowSec;
+    const canvas = document.getElementById("eegCanvas");
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    const totalHeight = Math.max(200, channels.length * 34);
+
+    function resize() {
+        const w = canvas.clientWidth || canvas.parentElement.clientWidth;
+        const h = totalHeight;
+        canvas.style.height = h + "px";
+        canvas.width = w * dpr;
+        canvas.height = h * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    window.addEventListener("resize", resize);
+    resize();
+
+    const totalDur = cfg.dt * (cfg.totalPoints - 1);
+
+    function valueAt(chIndex, tSec) {
+        let tt = tSec % totalDur;
+        if (tt < 0) tt += totalDur;
+        const idxF = tt / cfg.dt;
+        const i0 = Math.floor(idxF);
+        const i1 = Math.min(i0 + 1, cfg.totalPoints - 1);
+        const frac = idxF - i0;
+        const arr = cfg.data[chIndex];
+        return arr[i0] + (arr[i1] - arr[i0]) * frac;
+    }
+
+    const POINTS = 300;
+    const startT = performance.now() / 1000;
+
+    function draw(tsMs) {
+        const nowSec = tsMs / 1000 - startT;
+        const w = canvas.clientWidth || canvas.parentElement.clientWidth;
+        const h = totalHeight;
+        const laneH = h / channels.length;
+
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, w, h);
+
+        channels.forEach((name, i) => {
+            const laneY = i * laneH;
+            const midY = laneY + laneH / 2;
+            const amp = laneH * 0.42;
+
+            ctx.strokeStyle = "rgba(0,0,0,0.08)";
+            ctx.beginPath(); ctx.moveTo(0, laneY); ctx.lineTo(w, laneY); ctx.stroke();
+
+            ctx.strokeStyle = "#000000";
+            ctx.lineWidth = 1.2;
+            ctx.beginPath();
+            for (let p = 0; p <= POINTS; p++) {
+                const frac = p / POINTS;
+                const x = frac * w;
+                const tAtPoint = nowSec - windowSec * (1 - frac);
+                const val = valueAt(i, tAtPoint) * 1e6;
+                const y = midY - (val / 25) * amp;
+                if (p === 0) { ctx.moveTo(x, y); } else { ctx.lineTo(x, y); }
+            }
+            ctx.stroke();
+
+            ctx.fillStyle = "#333333";
+            ctx.font = "11px monospace";
+            ctx.fillText(name, 6, laneY + 13);
+        });
+
+        requestAnimationFrame(draw);
+    }
+    requestAnimationFrame(draw);
+
+    // Keep topomaps live: reload each image every $TOPO_REFRESH_MS ms.
+    const topoImgs = document.querySelectorAll("img.topo-live");
+    setInterval(() => {
+        topoImgs.forEach(img => {
+            const base = img.getAttribute("data-src");
+            img.src = base + "&t=" + Date.now();
+        });
+    }, $TOPO_REFRESH_MS);
+})();
+</script>
+</body>
+</html>
+""")
+
+
+def render_live_page(ctx):
+    meta = ctx["meta"]
+    region_options = ctx["region_options"]
+    region_choice = ctx["region_choice"]
+    recognized = ctx["recognized"]
+    custom_channels = ctx["custom_channels"]
+    band_pct = ctx["band_pct"]
+    dominant_band = ctx["dominant_band"]
+    args = ctx["args"]
+
+    region_boxes = "".join(
+        f'<div class="region-check"><label>'
+        f'<input type="checkbox" name="regions" value="{r}" {"checked" if r in region_choice else ""}> {r}'
+        f'</label></div>'
+        for r in region_options
+    ) or "<div class='caption'>No recognizable regions.</div>"
+
+    if meta["mongo_available"]:
+        mongo_status = f'<div class="badge ok">MongoDB: {meta["n_files"]} file(s) stitched</div>'
+    else:
+        mongo_status = '<div class="badge warn">MongoDB unavailable - using mock data</div>'
+
+    source = args.get("source", "auto")
+    chart_caption = (
+        f'{len(ctx["selected_channels"])} channels &middot; {ctx["sfreq"]:.0f} Hz &middot; '
+        f'{ctx["window_sec"]}s window &middot; '
+        f'{" + ".join(region_choice) if region_choice else "All regions"} &middot; '
+        f'{"MongoDB (live)" if meta["source"] == "mongo" else "Mock data"}'
+    )
+
+    if MNE_AVAILABLE and MATPLOTLIB_AVAILABLE:
+        if recognized:
+            topo_imgs = "".join(
+                f'<img class="topo-live" data-src="/live/api/topomap/{band}.png?{ctx["qs"]}" '
+                f'src="/live/api/topomap/{band}.png?{ctx["qs"]}" alt="{band} topomap">'
+                for band in LIVE_BAND_ORDER
+            )
+        else:
+            topo_imgs = (
+                "<div class='caption'>None of the current channels match a known electrode montage, "
+                "so no topomap can be drawn. See the Session Report below for a signal summary instead.</div>"
+            )
+    else:
+        topo_imgs = "<div class='caption'>Topomaps unavailable on this server (mne/matplotlib not installed).</div>"
+
+    custom_note = ""
+    if custom_channels:
+        shown = ", ".join(custom_channels[:6]) + ("..." if len(custom_channels) > 6 else "")
+        custom_note = f'<div class="caption">{len(custom_channels)} channel(s) don\'t match a known montage and aren\'t shown here: {shown}. See Session Report.</div>'
+
+    report_usage = (
+        f'- Session length: {ctx["session_minutes"]:.1f} min<br>'
+        f'- Data source: {"MongoDB (" + str(meta["n_files"]) + " file(s) stitched)" if meta["source"] == "mongo" else "Mock data"}<br>'
+        f'- Recording represented: {ctx["recording_seconds"]:.0f}s across {len(ctx["ch_names"])} channels<br>'
+        f'- Regions viewed this session: {", ".join(ctx["regions_seen"]) or "-"}<br>'
+        f'- Dashboard refreshes: {ctx["refresh_count"]}'
+    )
+
+    band_bars = "".join(
+        f'<div class="bar-row"><div class="bar-label">{band}</div>'
+        f'<div class="bar-track"><div class="bar-fill" style="width:{band_pct.get(band, 0):.1f}%"></div></div>'
+        f'<div class="bar-pct">{band_pct.get(band, 0):.1f}%</div></div>'
+        for band in LIVE_BANDS
+    )
+
+    dominant_note = ""
+    if dominant_band:
+        dominant_note = (
+            f'<p>Over this window, <strong>{dominant_band}</strong> power is dominant '
+            f'({band_pct[dominant_band]:.0f}% of band power) - {LIVE_BAND_DESCRIPTIONS[dominant_band]}. '
+            f'This is a general, research-based association, <strong>not a clinical or diagnostic assessment.</strong></p>'
+        )
+    if custom_channels:
+        dominant_note += (
+            f'<div class="caption">Includes {len(custom_channels)} non-standard-montage channel(s) that '
+            f"can't appear on the topomap: {', '.join(custom_channels[:10])}</div>"
+        )
+
+    html = LIVE_PAGE_TEMPLATE.substitute(
+        SEL_AUTO="selected" if source == "auto" else "",
+        SEL_MONGO="selected" if source == "mongo" else "",
+        SEL_MOCK="selected" if source == "mock" else "",
+        MONGO_STATUS=mongo_status,
+        N_CHANNELS=meta["n_channels_requested"],
+        SFREQ_MOCK=meta["sfreq_requested"],
+        WINDOW_SEC=ctx["window_sec"],
+        TOPO_REFRESH=ctx["topo_refresh"],
+        REGION_CHECKBOXES=region_boxes,
+        CHART_CAPTION=chart_caption,
+        TOPO_IMGS=topo_imgs,
+        CUSTOM_CHANNELS_NOTE=custom_note,
+        REPORT_USAGE=report_usage,
+        ANALYSIS_WINDOW_SEC=f'{ctx["analysis_window"] / ctx["sfreq"]:.0f}' if ctx["sfreq"] else "0",
+        BAND_BARS=band_bars,
+        DOMINANT_BAND_NOTE=dominant_note,
+        QS=ctx["qs"],
+        SWEEP_JSON=json.dumps(ctx["sweep_payload"]),
+        TOPO_REFRESH_MS=int(ctx["topo_refresh"] * 1000),
+    )
+    return html
+
+
+def render_live_report_text(ctx):
+    meta = ctx["meta"]
+    band_pct = ctx["band_pct"]
+    dominant_band = ctx["dominant_band"]
+    lines = [
+        "EEG Session Report",
+        f"Generated: {now_iso()}",
+        "",
+        "App usage:",
+        f"- Session length: {ctx['session_minutes']:.1f} min",
+        f"- Data source: {'MongoDB (' + str(meta['n_files']) + ' file(s) stitched)' if meta['source'] == 'mongo' else 'Mock data'}",
+        f"- Recording represented: {ctx['recording_seconds']:.0f}s across {len(ctx['ch_names'])} channels",
+        f"- Regions viewed: {', '.join(ctx['regions_seen']) or 'none'}",
+        "",
+        f"Band power mix (last {ctx['analysis_window'] / ctx['sfreq']:.0f}s): " + ", ".join(f"{k} {v:.1f}%" for k, v in band_pct.items()),
+    ]
+    if dominant_band:
+        lines.append(f"Dominant band: {dominant_band} - {LIVE_BAND_DESCRIPTIONS.get(dominant_band, '')}")
+    lines.append("This is a general, research-based association, not a clinical or diagnostic assessment.")
+    return "\n".join(lines) + "\n"
+
+
+@app.route("/live", methods=["GET"])
+def live_dashboard():
+    ctx = compute_live_context(request.args)
+    return render_live_page(ctx)
+
+
+@app.route("/live/report.txt", methods=["GET"])
+def live_report_txt():
+    ctx = compute_live_context(request.args)
+    text = render_live_report_text(ctx)
+    return Response(text, mimetype="text/plain", headers={
+        "Content-Disposition": "attachment; filename=eeg_session_report.txt"
+    })
+
+
+@app.route("/live/api/topomap/<band>.png", methods=["GET"])
+def live_topomap(band):
+    if not (MNE_AVAILABLE and MATPLOTLIB_AVAILABLE):
+        return jsonify({"error": "mne/matplotlib not installed on this server"}), 503
+    if band not in LIVE_BANDS and band != "Broadband":
+        return jsonify({"error": f"Unknown band '{band}'"}), 404
+
+    args = request.args
+    raw_data, ch_names, sfreq, meta = resolve_live_dataset(args)
+    window_sec, _ = live_window_params(args)
+    fallback_pool = set(get_live_fallback_pool())
+    recognized = [ch for ch in ch_names if ch in fallback_pool]
+
+    fig, ax = plt.subplots(figsize=(4.2, 4.2))
+    try:
+        if not recognized:
+            ax.axis("off")
+            ax.text(0.5, 0.5, "No channels match a\nknown montage", ha="center", va="center", fontsize=9)
+        else:
+            total_samples = raw_data.shape[1]
+            window_samples = max(1, int(window_sec * sfreq))
+            pos = int(time.time() * sfreq) % total_samples if total_samples else 0
+            idx = np.arange(pos - window_samples, pos) % total_samples
+
+            recognized_idx = [ch_names.index(ch) for ch in recognized]
+            chan_data_uv = raw_data[recognized_idx][:, idx] * 1e6
+            recognized_info = build_live_info(tuple(recognized), sfreq)
+
+            if band == "Broadband":
+                power = np.mean(np.abs(chan_data_uv), axis=1)
+                cbar_label = "uV"
+                insufficient = False
+            else:
+                lo, hi = LIVE_BANDS[band]
+                power = live_band_power(chan_data_uv, sfreq, lo, hi)
+                cbar_label = "uV^2"
+                insufficient = power is None
+
+            if insufficient:
+                lo = LIVE_BANDS[band][0]
+                ax.axis("off")
+                ax.text(0.5, 0.5, f"Collecting data\n(needs ~{max(2.0, 3.0/lo):.0f}s+ window)",
+                         ha="center", va="center", fontsize=9)
+            else:
+                im, _ = mne.viz.plot_topomap(
+                    power, recognized_info, axes=ax, show=False, cmap="jet",
+                    sensors=True, contours=0, extrapolate="head",
+                )
+                ax.set_title(band, fontsize=11)
+                cbar = fig.colorbar(im, ax=ax, shrink=0.75)
+                cbar.ax.tick_params(labelsize=7)
+                cbar.set_label(cbar_label, fontsize=8)
+
+        fig.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=110)
+    finally:
+        plt.close(fig)
+
+    buf.seek(0)
+    resp = send_file(buf, mimetype="image/png")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.errorhandler(413)

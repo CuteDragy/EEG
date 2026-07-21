@@ -48,12 +48,22 @@ def display(data: dict):
         return
 
     # ── Key metrics ───────────────────────────────────────────────────────────
-    eeg_ch  = info.get("n_signals", 1) - 1
+    fmt = info.get("format", "")
+
+    if fmt == "edf":
+        eeg_ch = info.get("n_signals", 1) - 1  # EDF's last "channel" is the annotations track
+    else:
+        eeg_ch = info.get("n_channels", "—")
     file_mb = data.get("file_size_bytes", 0) / (1024 * 1024)
 
-    # EDF: uniform sfreq across EEG channels; CSV: estimated_sampling_rate_hz
+    # EDF: channels is a list of dicts (per-channel metadata), so the first
+    # entry may carry its own sampling_rate_hz. CSV/TSV/NPY/JSON's "channels"
+    # is just a list of names, so fall straight through to the file-level
+    # estimated_sampling_rate_hz instead.
+    channels_field = info.get("channels") or []
+    first_channel = channels_field[0] if channels_field else None
     sfreq = (
-        info.get("channels", [{}])[0].get("sampling_rate_hz")
+        (first_channel.get("sampling_rate_hz") if isinstance(first_channel, dict) else None)
         or info.get("estimated_sampling_rate_hz")
         or "—"
     )
@@ -73,8 +83,6 @@ def display(data: dict):
     ], equal=True, expand=True))
 
     # ── Recording metadata + Signal config (EDF) ──────────────────────────────
-    fmt = info.get("format", "")
-
     if fmt == "edf":
         channels = info.get("channels", [])
         eeg_chs  = [c for c in channels if c.get("label") != "EDF Annotations"]
