@@ -1,20 +1,28 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{% block title %}EEG Dataset Server{% endblock %}</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-</head>
-<body>
-  <h1>🧠 EEG Dataset Server</h1>
-  <nav>
-    <a href="/" class="{{ 'active' if active == 'dashboard' else '' }}">Dashboard</a>
-    <a href="/upload-page" class="{{ 'active' if active == 'upload' else '' }}">Upload</a>
-  </nav>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}EEG Dataset Server{% endblock %}</title>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='css/style.css') }}"
+    />
+  </head>
+  <body>
+    <h1>🧠 EEG Dataset Server</h1>
+    <nav>
+      <a href="/" class="{{ 'active' if active == 'dashboard' else '' }}"
+        >Dashboard</a
+      >
+      <a
+        href="/upload-page"
+        class="{{ 'active' if active == 'upload' else '' }}"
+        >Upload</a
+      >
+      <a href="/live">Live Monitor</a>
+    </nav>
 
-  {% block content %}{% endblock %}
-
-  {% block scripts %}{% endblock %}
-</body>
+    {% block content %}{% endblock %} {% block scripts %}{% endblock %}
+  </body>
 </html>
