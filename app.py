@@ -371,7 +371,6 @@ def parse_csv(filepath, ext, opts=None):
     missing = df.isna().sum().to_dict()
     missing = {k: int(v) for k, v in missing.items()}
 
-    # Try to detect a time/timestamp column to estimate sampling rate
     time_col = None
     for candidate in ["time", "timestamp", "Time", "Timestamp", "t"]:
         if candidate in df.columns:
@@ -439,7 +438,6 @@ def parse_npy(filepath, opts=None):
         "dtype": str(arr.dtype),
         "size_elements": int(arr.size),
     }
-    # Heuristic: assume (channels, samples) or (samples, channels) for 2D
     if arr.ndim == 2:
         rows, cols = arr.shape
         info["interpretation_note"] = (
@@ -453,7 +451,7 @@ def parse_npy(filepath, opts=None):
 
     if opts.get("enable_mne", True):
         sfreq = opts.get("sfreq_override")
-        orientation = opts.get("npy_orientation")  # "channels_x_samples" or "samples_x_channels"
+        orientation = opts.get("npy_orientation")
         if arr.ndim != 2:
             info["mne"] = {"available": False, "reason": "MNE enrichment needs a 2D (channels x samples) array"}
         elif not sfreq:
@@ -498,7 +496,6 @@ def parse_json_file(filepath, opts=None):
     elif isinstance(data, dict):
         info["top_level_type"] = "object"
         info["top_level_keys"] = list(data.keys())
-        # Column-oriented EEG: {"Fp1": [...], "Fp2": [...], "sfreq": 256, ...}
         array_like_keys = {}
         scalar_keys = {}
         for k, v in data.items():
@@ -532,7 +529,7 @@ def parse_json_file(filepath, opts=None):
             else:
                 ch_names = list(array_like_keys.keys())
                 channel_arrays = [np.asarray(data[name], dtype=np.float64) for name in ch_names]
-                stacked = np.vstack(channel_arrays)  # (channels, samples)
+                stacked = np.vstack(channel_arrays)
                 info["mne"] = mne_enrich_array(stacked, ch_names, sfreq)
     else:
         info["top_level_type"] = type(data).__name__
@@ -541,25 +538,6 @@ def parse_json_file(filepath, opts=None):
 
 
 def parse_edf(filepath, opts=None):
-    """
-    Minimal native EDF/EDF+ header parser.
-    EDF spec: fixed-length ASCII header, no external dependency needed.
-    Reference layout (byte offsets in the 256-byte main header, plus
-    256 bytes per signal in the signal header block):
-        8    version
-        80   patient id
-        80   recording id
-        8    start date (dd.mm.yy)
-        8    start time (hh.mm.ss)
-        8    number of bytes in header
-        44   reserved
-        8    number of data records
-        8    duration of a data record (seconds)
-        4    number of signals (ns)
-    Then per-signal (ns times each): label(16), transducer(80), physical
-    dimension(8), physical min(8), physical max(8), digital min(8),
-    digital max(8), prefiltering(80), n samples per record(8), reserved(32)
-    """
     with open(filepath, "rb") as f:
         header = f.read(256)
         if len(header) < 256:
@@ -580,7 +558,6 @@ def parse_edf(filepath, opts=None):
         if len(sig_header) < signal_header_size:
             raise ValueError("EDF signal header truncated/corrupt")
 
-        # EDF signal header field widths, in order, per the spec.
         field_widths = [
             ("label", 16),
             ("transducer", 80),
@@ -664,11 +641,6 @@ def parse_edf(filepath, opts=None):
 
 # --------------------------------------------------------------------------
 # MNE enrichment (optional, additive)
-# Builds an mne.io.Raw / RawArray purely to read off structural metadata
-# that MNE already knows how to compute (channel typing, montage matching,
-# annotations/events). No filtering, resampling, or spectral analysis is
-# performed - this stays in the same "structural info only" spirit as the
-# native parsers above.
 # --------------------------------------------------------------------------
 
 _STANDARD_1020_NAMES = None
@@ -683,7 +655,6 @@ def _get_standard_1020_names():
 
 
 def guess_channel_types(ch_names):
-    """Cheap name-based EEG/EOG/ECG/EMG/stim heuristic (no signal inspection)."""
     types = {}
     for name in ch_names:
         n = name.strip().rstrip(".").upper()
@@ -771,7 +742,6 @@ def build_mne_summary(raw):
 
 
 def mne_enrich_edf(filepath):
-    """Re-reads the EDF via mne.io.read_raw_edf (header only, preload=False)."""
     if not MNE_AVAILABLE:
         return {"available": False, "reason": "mne is not installed"}
     try:
@@ -783,7 +753,6 @@ def mne_enrich_edf(filepath):
 
 
 def mne_enrich_array(data_channels_x_samples, ch_names, sfreq):
-    """Wraps an in-memory (channels x samples) array in an mne.io.RawArray."""
     if not MNE_AVAILABLE:
         return {"available": False, "reason": "mne is not installed"}
     if not sfreq or sfreq <= 0:
@@ -812,14 +781,6 @@ PARSERS = {
 # ==========================================================================
 # LIVE EEG MONITORING DASHBOARD  (merged in from the Streamlit app.py)
 # ==========================================================================
-# Ports every feature of the original Streamlit dashboard onto Flask routes
-# under /live: MongoDB/mock data source selection, region filtering, a
-# live-sweeping multichannel signal chart (HTML5 canvas), per-band
-# topographic maps, and a downloadable session report. Flask has no
-# built-in rerun-on-interaction like Streamlit, so the sidebar controls are
-# a plain <form method="GET"> that reloads /live with new query params; the
-# sweep chart animates client-side and the topomaps refresh themselves via
-# a periodic image reload - both driven by requestAnimationFrame/JS timers.
 
 try:
     import matplotlib
@@ -853,9 +814,6 @@ LIVE_BAND_DESCRIPTIONS = {
 LIVE_CANVAS_POINT_BUDGET = 3000
 LIVE_REGION_ORDER = ["Frontal", "Central", "Temporal", "Parietal", "Occipital", "Other"]
 
-# Guessed field names for raw EEG-chunk documents. These live in the same
-# MongoDB collection as the dataset registry above, and are distinguished
-# from parsed-upload metadata records by having one of LIVE_DATA_KEYS.
 LIVE_CHANNEL_KEYS = ["channels", "channel_names", "ch_names"]
 LIVE_SFREQ_KEYS = ["sampling_rate", "sfreq", "fs", "sample_rate"]
 LIVE_DATA_KEYS = ["data", "eeg_data", "samples", "values"]
@@ -876,8 +834,6 @@ def _live_first_present(doc, candidate_keys):
 
 
 def fetch_live_documents(ttl=30):
-    """Pull raw EEG-chunk documents from the shared MongoDB collection,
-    cached for `ttl` seconds (mirrors app.py's @st.cache_data(ttl=30))."""
     if not MONGO_CONNECTED:
         return None
     with _live_cache_lock:
@@ -896,8 +852,6 @@ def fetch_live_documents(ttl=30):
 
 
 def build_live_raw_from_documents(docs):
-    """Stitches raw EEG-chunk documents into one continuous (channels,
-    samples) array in sequence - ported directly from app.py."""
     if not docs:
         return None, None, None, 0
 
@@ -1011,8 +965,6 @@ def generate_mock_eeg(n_channels, sfreq, duration_sec=60):
 
 
 def downsample_for_display(data_uv, target_points=LIVE_CANVAS_POINT_BUDGET):
-    """Anti-aliased downsample of a (channels, samples) uV array so the
-    browser payload stays bounded no matter how long the recording is."""
     out = data_uv
     if SCIPY_AVAILABLE:
         while out.shape[1] > target_points * 2:
@@ -1032,8 +984,6 @@ def live_band_power(chan_data_uv, sfreq, lo, hi):
 
 
 def resolve_live_dataset(args):
-    """Resolves (RAW_DATA volts, CH_NAMES, sfreq, meta) from query params,
-    mirroring app.py's sidebar data-source logic."""
     source = args.get("source", "auto")
     try:
         n_channels = max(4, min(256, int(args.get("n_channels", 64))))
@@ -1101,7 +1051,6 @@ def live_selected_channels(ch_names, regions_param):
 # --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
-
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -1188,10 +1137,6 @@ def upload():
 
     elapsed_ms = round((time.time() - start_time) * 1000, 2)
 
-    # Store the raw bytes in GridFS so the actual file (not just its parsed
-    # metadata) survives a server restart/redeploy, since UPLOAD_FOLDER lives
-    # on ephemeral local disk. This is the only way the data goes away short
-    # of an explicit delete.
     gridfs_file_id = gridfs_save(dataset_id, filepath, original_filename)
 
     record = {
@@ -1292,7 +1237,6 @@ def get_dataset(dataset_id):
 
 @app.route("/datasets/<dataset_id>/view", methods=["GET"])
 def view_dataset(dataset_id):
-    """Render a professional detail page for a dataset."""
     ds = DATASETS.get(dataset_id)
     if ds is None:
         abort(404)
@@ -1313,7 +1257,6 @@ def get_channel_data(dataset_id, channel_idx):
     if not os.path.exists(filepath):
         return jsonify({"error": "File not found"}), 410
 
-    # Try to use MNE; if it fails, fall back to a simple manual read?
     try:
         import mne
         raw = mne.io.read_raw_edf(filepath, preload=True, verbose="ERROR")
@@ -1325,7 +1268,6 @@ def get_channel_data(dataset_id, channel_idx):
         data = data.flatten()
         ch_name = ch_names[channel_idx]
     except Exception as e:
-        # Log the error and return a friendly message
         logger.error("Failed to read EDF with MNE: %s", e)
         return jsonify({"error": f"Failed to read EDF: {str(e)}"}), 500
 
@@ -1341,7 +1283,6 @@ def get_channel_data(dataset_id, channel_idx):
     }
 
     if mode in ("time", "both"):
-        # Decimate if too many points
         step = max(1, len(data) // max_points)
         decimated_data = data[::step]
         decimated_times = times[::step]
@@ -1382,11 +1323,6 @@ def delete_dataset(dataset_id):
 
 @app.route("/datasets", methods=["DELETE"])
 def delete_datasets_bulk():
-    """
-    Bulk delete. Two modes:
-      DELETE /datasets?ids=id1,id2,id3   -> delete just those
-      DELETE /datasets?confirm=true      -> wipe every dataset (destructive)
-    """
     ids_param = request.args.get("ids", "").strip()
     confirm = request.args.get("confirm", "false").strip().lower() == "true"
 
@@ -1420,7 +1356,6 @@ def delete_datasets_bulk():
 
 @app.route("/datasets/<dataset_id>", methods=["PATCH"])
 def rename_dataset(dataset_id):
-    """Rename a dataset's display filename (metadata only - stored file/path unchanged)."""
     ds = DATASETS.get(dataset_id)
     if ds is None:
         return jsonify({"error": "Dataset not found"}), 404
@@ -1455,8 +1390,6 @@ def download_dataset(dataset_id):
 
 @app.route("/datasets/<dataset_id>/reparse", methods=["POST"])
 def reparse_dataset(dataset_id):
-    """Re-run parsing on an already-uploaded file with different query-param opts,
-    e.g. POST /datasets/<id>/reparse?mne=false or ?sfreq=256 - without re-uploading."""
     ds = DATASETS.get(dataset_id)
     if ds is None:
         return jsonify({"error": "Dataset not found"}), 404
@@ -1492,9 +1425,6 @@ def reparse_dataset(dataset_id):
 
 
 def compute_live_context(args):
-    """Single source of truth for both the /live HTML page and the
-    /live/report.txt download - resolves the data source, applies the
-    control settings, and computes the session report numbers."""
     raw_data, ch_names, sfreq, meta = resolve_live_dataset(args)
     window_sec, topo_refresh = live_window_params(args)
     region_options, region_choice, selected_channels = live_selected_channels(ch_names, args.get("regions"))
@@ -1744,14 +1674,30 @@ LIVE_PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
     }
     requestAnimationFrame(draw);
 
-    // Keep topomaps live: reload each image every $TOPO_REFRESH_MS ms.
+    // OPTIMIZATION: Reload topomap images without stacking requests
     const topoImgs = document.querySelectorAll("img.topo-live");
+    
+    function refreshTopomap(img) {
+        if (img.dataset.loading === "true") return; // Skip if previous request is still pending
+        img.dataset.loading = "true";
+        
+        const base = img.getAttribute("data-src");
+        const tempImg = new Image();
+        
+        tempImg.onload = () => {
+            img.src = tempImg.src;
+            img.dataset.loading = "false";
+        };
+        tempImg.onerror = () => {
+            img.dataset.loading = "false";
+        };
+        
+        tempImg.src = base + "&t=" + Date.now();
+    }
+
     setInterval(() => {
-        topoImgs.forEach(img => {
-            const base = img.getAttribute("data-src");
-            img.src = base + "&t=" + Date.now();
-        });
-    }, $TOPO_REFRESH_MS);
+        topoImgs.forEach(img => refreshTopomap(img));
+    }, Math.max(2000, $TOPO_REFRESH_MS)); // Enforce a minimum 2-second interval
 })();
 </script>
 </body>
@@ -1897,6 +1843,9 @@ def live_report_txt():
         "Content-Disposition": "attachment; filename=eeg_session_report.txt"
     })
 
+_topomap_cache = {}
+_topomap_lock = threading.Lock()
+TOPOMAP_CACHE_TTL = 2.0
 
 @app.route("/live/api/topomap/<band>.png", methods=["GET"])
 def live_topomap(band):
@@ -1906,6 +1855,24 @@ def live_topomap(band):
         return jsonify({"error": f"Unknown band '{band}'"}), 404
 
     args = request.args
+    cache_key = (
+        band,
+        args.get("source", "auto"),
+        args.get("n_channels", "64"),
+        args.get("sfreq", "160"),
+        args.get("regions", ""),
+        args.get("window_sec", "6")
+    )
+
+    now = time.time()
+    with _topomap_lock:
+        if cache_key in _topomap_cache:
+            cached_time, cached_png = _topomap_cache[cache_key]
+            if now - cached_time < TOPOMAP_CACHE_TTL:
+                resp = send_file(BytesIO(cached_png), mimetype="image/png")
+                resp.headers["Cache-Control"] = "no-store"
+                return resp
+
     raw_data, ch_names, sfreq, meta = resolve_live_dataset(args)
     window_sec, _ = live_window_params(args)
     fallback_pool = set(get_live_fallback_pool())
@@ -1954,11 +1921,15 @@ def live_topomap(band):
         fig.tight_layout()
         buf = BytesIO()
         fig.savefig(buf, format="png", dpi=110)
+        png_bytes = buf.getvalue()
     finally:
         plt.close(fig)
+        plt.clf()
 
-    buf.seek(0)
-    resp = send_file(buf, mimetype="image/png")
+    with _topomap_lock:
+        _topomap_cache[cache_key] = (now, png_bytes)
+
+    resp = send_file(BytesIO(png_bytes), mimetype="image/png")
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
