@@ -187,7 +187,7 @@ DATASETS = {}  # dataset_id -> metadata dict
 # to in-memory-only storage; nothing about the API surface changes.
 # --------------------------------------------------------------------------
 
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://test:EUk6fKxazi4E2JEG@cluster0.1m2rwpo.mongodb.net/?appName=Cluster0")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 MONGO_DB_NAME = os.environ.get("MONGO_DB", "eeg_dataset_server")
 MONGO_COLLECTION = "datasets"
 
@@ -983,6 +983,81 @@ def live_band_power(chan_data_uv, sfreq, lo, hi):
     return np.mean(filtered ** 2, axis=1)
 
 
+def load_full_signal_from_dataset(ds, args):
+    """Load the FULL real signal (channels x samples, in Volts) from an
+    already-uploaded dataset, for use on the /live page. Unlike the /upload
+    parsers (which only store a 5-row preview in Mongo/memory), this reads
+    the whole file back off disk/GridFS. Returns (data_v, ch_names, sfreq,
+    error) - data_v is None and error is set on any failure."""
+    ext = ds["extension"]
+    filepath = os.path.join(UPLOAD_FOLDER, ds["stored_filename"])
+    if not os.path.exists(filepath):
+        gridfs_restore_to_disk(ds.get("gridfs_file_id"), filepath)
+    if not os.path.exists(filepath):
+        return None, None, None, "Original file is gone (not in GridFS and not on local disk)."
+
+    try:
+        if ext == "edf":
+            if not MNE_AVAILABLE:
+                return None, None, None, "mne is not installed on this server; required to read EDF."
+            raw = mne.io.read_raw_edf(filepath, preload=True, verbose="ERROR")
+            data_v = raw.get_data()  # already in Volts
+            return data_v, list(raw.ch_names), float(raw.info["sfreq"]), None
+
+        elif ext in ("csv", "tsv"):
+            sep = "\t" if ext == "tsv" else ","
+            df = pd.read_csv(filepath, sep=sep)
+            time_col = next((c for c in ["time", "timestamp", "Time", "Timestamp", "t"] if c in df.columns), None)
+            channels = [c for c in df.columns if c != time_col]
+            numeric = df[channels].apply(pd.to_numeric, errors="coerce")
+            usable = [c for c in channels if numeric[c].notna().any()]
+            if not usable:
+                return None, None, None, "No numeric channel columns found in this CSV/TSV."
+            sfreq = args.get("sfreq", type=float)
+            if not sfreq and time_col is not None and len(df) > 1:
+                t = pd.to_numeric(df[time_col], errors="coerce").dropna()
+                diffs = t.diff().dropna()
+                if len(diffs) and float(diffs.median()) > 0:
+                    sfreq = 1.0 / float(diffs.median())
+            if not sfreq:
+                return None, None, None, "No sampling rate detected; retry with ?sfreq=<Hz>."
+            data_uv = numeric[usable].fillna(0.0).to_numpy(dtype=np.float64).T
+            return data_uv * 1e-6, usable, float(sfreq), None
+
+        elif ext == "npy":
+            arr = np.load(filepath, allow_pickle=False)
+            if arr.ndim != 2:
+                return None, None, None, "NPY array must be 2D (channels x samples) for live viewing."
+            sfreq = args.get("sfreq", type=float)
+            orientation = args.get("npy_orientation", "channels_x_samples")
+            if not sfreq:
+                return None, None, None, "No sampling rate stored for this file; retry with ?sfreq=<Hz>."
+            data = arr if orientation == "channels_x_samples" else arr.T
+            ch_names = [f"CH{i+1:03d}" for i in range(data.shape[0])]
+            return data.astype(np.float64) * 1e-6, ch_names, float(sfreq), None
+
+        elif ext == "json":
+            with open(filepath) as fh:
+                payload = json.load(fh)
+            if not isinstance(payload, dict):
+                return None, None, None, "Live view only supports object-shaped JSON with array fields per channel."
+            array_fields = {k: v for k, v in payload.items() if isinstance(v, list)}
+            sfreq = args.get("sfreq", type=float) or payload.get("sfreq") or payload.get("sampling_rate") or payload.get("fs")
+            if not array_fields:
+                return None, None, None, "No array fields found in this JSON to treat as channels."
+            if not sfreq:
+                return None, None, None, "No sampling rate found; retry with ?sfreq=<Hz>."
+            ch_names = list(array_fields.keys())
+            data_uv = np.vstack([np.asarray(array_fields[k], dtype=np.float64) for k in ch_names])
+            return data_uv * 1e-6, ch_names, float(sfreq), None
+
+        else:
+            return None, None, None, f"Unsupported extension '{ext}'."
+    except Exception as e:
+        logger.error("Live: failed to load full signal for dataset %s: %s", ds.get("dataset_id"), e)
+        return None, None, None, f"Failed to read file: {e}"
+
+
 def resolve_live_dataset(args):
     source = args.get("source", "auto")
     try:
@@ -994,11 +1069,32 @@ def resolve_live_dataset(args):
     except (TypeError, ValueError):
         sfreq_mock = 160
 
+    # "dataset" source: play back the REAL signal from a file you uploaded
+    # through /upload, instead of the (separate, never-populated) live-chunk
+    # Mongo documents that "mongo"/"auto" look for.
+    dataset_id = args.get("dataset_id")
+    dataset_error = None
+    if source == "dataset" and dataset_id:
+        ds = DATASETS.get(dataset_id)
+        if ds is None:
+            dataset_error = "Dataset not found (it may have been deleted)."
+        else:
+            data_v, ds_ch_names, ds_sfreq, dataset_error = load_full_signal_from_dataset(ds, args)
+            if data_v is not None:
+                return data_v, ds_ch_names, ds_sfreq, {
+                    "n_files": 1,
+                    "mongo_available": True,
+                    "source": "dataset",
+                    "dataset_name": ds["original_filename"],
+                    "n_channels_requested": n_channels,
+                    "sfreq_requested": sfreq_mock,
+                }
+
     docs = fetch_live_documents()
     mongo_data, mongo_ch_names, mongo_sfreq, n_files = build_live_raw_from_documents(docs)
     mongo_available = mongo_data is not None
 
-    use_mongo = mongo_available and source != "mock"
+    use_mongo = mongo_available and source != "mock" and source != "dataset"
     if source == "mongo" and not mongo_available:
         use_mongo = False
 
@@ -1008,6 +1104,7 @@ def resolve_live_dataset(args):
         "source": "mongo" if use_mongo else "mock",
         "n_channels_requested": n_channels,
         "sfreq_requested": sfreq_mock,
+        "dataset_error": dataset_error,
     }
 
     if use_mongo:
@@ -1466,6 +1563,7 @@ def compute_live_context(args):
 
     qs = urlencode({
         "source": args.get("source", "auto"),
+        "dataset_id": args.get("dataset_id", ""),
         "n_channels": args.get("n_channels", 64),
         "sfreq": args.get("sfreq", 160),
         "regions": ",".join(region_choice),
@@ -1536,7 +1634,13 @@ LIVE_PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
     <select name="source">
       <option value="auto" $SEL_AUTO>Auto (MongoDB, fallback to mock)</option>
       <option value="mongo" $SEL_MONGO>MongoDB only</option>
+      <option value="dataset" $SEL_DATASET>An uploaded dataset</option>
       <option value="mock" $SEL_MOCK>Mock data only</option>
+    </select>
+    <label>Uploaded dataset</label>
+    <select name="dataset_id">
+      <option value="">-- choose a dataset --</option>
+      $DATASET_OPTIONS
     </select>
     $MONGO_STATUS
 
@@ -1722,17 +1826,26 @@ def render_live_page(ctx):
         for r in region_options
     ) or "<div class='caption'>No recognizable regions.</div>"
 
-    if meta["mongo_available"]:
+    if meta["source"] == "dataset":
+        mongo_status = f'<div class="badge ok">Dataset: {meta["dataset_name"]}</div>'
+    elif meta.get("dataset_error"):
+        mongo_status = f'<div class="badge warn">Couldn\'t load that dataset ({meta["dataset_error"]}) - showing mock data</div>'
+    elif meta["mongo_available"]:
         mongo_status = f'<div class="badge ok">MongoDB: {meta["n_files"]} file(s) stitched</div>'
     else:
-        mongo_status = '<div class="badge warn">MongoDB unavailable - using mock data</div>'
+        mongo_status = '<div class="badge warn">No live-chunk documents in MongoDB - using mock data. (Uploaded datasets are stored separately; pick "An uploaded dataset" above to view one.)</div>'
 
     source = args.get("source", "auto")
+    source_label = {"dataset": f'Dataset: {meta.get("dataset_name", "")}', "mongo": "MongoDB (live)"}.get(meta["source"], "Mock data")
     chart_caption = (
         f'{len(ctx["selected_channels"])} channels &middot; {ctx["sfreq"]:.0f} Hz &middot; '
         f'{ctx["window_sec"]}s window &middot; '
         f'{" + ".join(region_choice) if region_choice else "All regions"} &middot; '
-        f'{"MongoDB (live)" if meta["source"] == "mongo" else "Mock data"}'
+        f'{source_label}'
+    )
+    dataset_options = "".join(
+        f'<option value="{d["dataset_id"]}" {"selected" if d["dataset_id"] == args.get("dataset_id") else ""}>{d["original_filename"]}</option>'
+        for d in sorted(DATASETS.values(), key=lambda d: d["uploaded_at"], reverse=True)
     )
 
     if MNE_AVAILABLE and MATPLOTLIB_AVAILABLE:
@@ -1757,7 +1870,7 @@ def render_live_page(ctx):
 
     report_usage = (
         f'- Session length: {ctx["session_minutes"]:.1f} min<br>'
-        f'- Data source: {"MongoDB (" + str(meta["n_files"]) + " file(s) stitched)" if meta["source"] == "mongo" else "Mock data"}<br>'
+        f'- Data source: {source_label}<br>'
         f'- Recording represented: {ctx["recording_seconds"]:.0f}s across {len(ctx["ch_names"])} channels<br>'
         f'- Regions viewed this session: {", ".join(ctx["regions_seen"]) or "-"}<br>'
         f'- Dashboard refreshes: {ctx["refresh_count"]}'
@@ -1786,7 +1899,9 @@ def render_live_page(ctx):
     html = LIVE_PAGE_TEMPLATE.substitute(
         SEL_AUTO="selected" if source == "auto" else "",
         SEL_MONGO="selected" if source == "mongo" else "",
+        SEL_DATASET="selected" if source == "dataset" else "",
         SEL_MOCK="selected" if source == "mock" else "",
+        DATASET_OPTIONS=dataset_options,
         MONGO_STATUS=mongo_status,
         N_CHANNELS=meta["n_channels_requested"],
         SFREQ_MOCK=meta["sfreq_requested"],

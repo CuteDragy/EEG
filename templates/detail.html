@@ -550,26 +550,48 @@ info.format %}
       select.appendChild(option);
     });
 
-    let timeChartInstance = null;
-    let fftChartInstance = null;
+    // Destroy WHATEVER Chart.js has registered on a canvas, not just
+    // whatever we happen to be holding a reference to. Chart.js tracks
+    // "this canvas is in use" internally (Chart.getChart looks that up);
+    // if our own tracking variable ever drifts out of sync with it - a
+    // double-click on Load, or a chart constructor throwing partway
+    // through on bad data - "destroy the variable we have" stops being
+    // enough and you get "Canvas is already in use" on the next render.
+    function destroyExisting(canvasId) {
+      const existing = Chart.getChart(canvasId);
+      if (existing) existing.destroy();
+    }
 
-    document.getElementById('loadSignalBtn').addEventListener('click', function() {
+    const loadBtn = document.getElementById('loadSignalBtn');
+
+    loadBtn.addEventListener('click', function() {
       const idx = parseInt(select.value);
       if (isNaN(idx)) return;
+
+      // Destroy immediately on click (synchronously), before the fetch
+      // even starts - this closes the async window where a second click
+      // could race a chart build and leave the registry out of sync.
+      destroyExisting('timeChart');
+      destroyExisting('fftChart');
+      loadBtn.disabled = true;
 
       fetch(`/datasets/${datasetId}/channel/${idx}?mode=both&max_points=1500&max_freq=50`)
         .then(res => {
           if (!res.ok) {
-            // Handle error response
             return res.json().then(err => { throw new Error(err.error || 'Server error'); });
           }
           return res.json();
         })
         .then(data => {
-          // Time chart
+          if (!data.time || !data.fft) {
+            throw new Error('Response is missing time/fft data for this channel.');
+          }
+
+          // Destroy again right before creating, in case anything else
+          // rendered on these canvases while the fetch was in flight.
+          destroyExisting('timeChart');
           const ctxTime = document.getElementById('timeChart').getContext('2d');
-          if (timeChartInstance) timeChartInstance.destroy();
-          timeChartInstance = new Chart(ctxTime, {
+          new Chart(ctxTime, {
             type: 'line',
             data: {
               labels: data.time.times,
@@ -602,10 +624,9 @@ info.format %}
             }
           });
 
-          // FFT chart
+          destroyExisting('fftChart');
           const ctxFft = document.getElementById('fftChart').getContext('2d');
-          if (fftChartInstance) fftChartInstance.destroy();
-          fftChartInstance = new Chart(ctxFft, {
+          new Chart(ctxFft, {
             type: 'line',
             data: {
               labels: data.fft.frequencies,
@@ -642,6 +663,9 @@ info.format %}
         })
         .catch(err => {
           alert('Failed to load signal: ' + err.message);
+        })
+        .finally(() => {
+          loadBtn.disabled = false;
         });
     });
   });
