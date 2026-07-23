@@ -899,6 +899,47 @@ def get_live_fallback_pool():
     return tuple(mne.channels.make_standard_montage("standard_1005").ch_names)
 
 
+def _normalize_ch_name(name):
+    """Real EEG file exports rarely use bare '10-20' names like 'Fc5' - EDF
+    in particular commonly pads to a fixed width with trailing dots
+    ('Fc5.', 'C3..'), and other exporters add an 'EEG ' prefix or a
+    '-REF'/'-LE' reference suffix. Strip that padding so real channel
+    names can be matched against the standard montage."""
+    n = name.strip()
+    if n.upper().startswith("EEG "):
+        n = n[4:]
+    n = n.rstrip(". \t")
+    for suffix in ("-REF", "-LE", "-RE"):
+        if n.upper().endswith(suffix):
+            n = n[: -len(suffix)]
+    return n.strip()
+
+
+@lru_cache(maxsize=4)
+def get_live_montage_lookup():
+    """Maps normalized/uppercased channel name -> canonical montage name,
+    e.g. 'FC5' -> 'Fc5'. Used to recognize real dataset channel names
+    against the standard_1005 montage regardless of formatting."""
+    return {name.upper(): name for name in get_live_fallback_pool()}
+
+
+def match_live_channels(ch_names):
+    """Given a dataset's raw channel names, return (recognized_indices,
+    recognized_original, canonical_montage_names) - parallel lists of only
+    the channels that match a known montage position. Indices returned
+    directly (rather than re-deriving via .index()) so this stays correct
+    even if a file has duplicate channel labels."""
+    lookup = get_live_montage_lookup()
+    idx, recognized, canonical = [], [], []
+    for i, ch in enumerate(ch_names):
+        canon = lookup.get(_normalize_ch_name(ch).upper())
+        if canon:
+            idx.append(i)
+            recognized.append(ch)
+            canonical.append(canon)
+    return idx, recognized, canonical
+
+
 def pick_live_channel_names(n_channels):
     exact = {16: "biosemi16", 32: "biosemi32", 64: "biosemi64"}
     if n_channels in exact:
@@ -1556,9 +1597,8 @@ def compute_live_context(args):
         regions_seen_sorted = sorted(LIVE_STATS["regions_seen"])
 
     total_samples = raw_data.shape[1]
-    fallback_pool = set(get_live_fallback_pool())
-    recognized = [ch for ch in ch_names if ch in fallback_pool]
-    custom_channels = [ch for ch in ch_names if ch not in fallback_pool]
+    _, recognized, _ = match_live_channels(ch_names)
+    custom_channels = [ch for ch in ch_names if ch not in set(recognized)]
 
     sel_idx = [ch_names.index(ch) for ch in selected_channels]
     display_data = downsample_for_display(raw_data[sel_idx])
@@ -1995,6 +2035,7 @@ def live_topomap(band):
     cache_key = (
         band,
         args.get("source", "auto"),
+        args.get("dataset_id", ""),
         args.get("n_channels", "64"),
         args.get("sfreq", "160"),
         args.get("regions", ""),
@@ -2012,8 +2053,7 @@ def live_topomap(band):
 
     raw_data, ch_names, sfreq, meta = resolve_live_dataset(args)
     window_sec, _ = live_window_params(args)
-    fallback_pool = set(get_live_fallback_pool())
-    recognized = [ch for ch in ch_names if ch in fallback_pool]
+    recognized_idx, recognized, canonical_names = match_live_channels(ch_names)
 
     fig, ax = plt.subplots(figsize=(4.2, 4.2))
     try:
@@ -2026,9 +2066,8 @@ def live_topomap(band):
             pos = int(time.time() * sfreq) % total_samples if total_samples else 0
             idx = np.arange(pos - window_samples, pos) % total_samples
 
-            recognized_idx = [ch_names.index(ch) for ch in recognized]
             chan_data_uv = raw_data[recognized_idx][:, idx] * 1e6
-            recognized_info = build_live_info(tuple(recognized), sfreq)
+            recognized_info = build_live_info(tuple(canonical_names), sfreq)
 
             if band == "Broadband":
                 power = np.mean(np.abs(chan_data_uv), axis=1)
