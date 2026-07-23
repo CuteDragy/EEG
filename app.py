@@ -821,6 +821,8 @@ LIVE_ORDER_KEYS = ["chunk_index", "sequence", "sequence_index", "part", "part_nu
 
 _live_docs_cache = {"docs": None, "ts": 0.0}
 _live_cache_lock = threading.Lock()
+_dataset_signal_cache = {}  # dataset_id -> {"data": ..., "ch_names": ..., "sfreq": ..., "error": ..., "ts": float}
+_dataset_signal_cache_lock = threading.Lock()
 
 LIVE_STATS_LOCK = threading.Lock()
 LIVE_STATS = {"session_start": time.time(), "refresh_count": 0, "regions_seen": set()}
@@ -1058,6 +1060,26 @@ def load_full_signal_from_dataset(ds, args):
         return None, None, None, f"Failed to read file: {e}"
 
 
+def load_full_signal_from_dataset_cached(ds, args, ttl=30):
+    """load_full_signal_from_dataset() reads and parses the whole file from
+    disk on every call - fine for a one-off page load, but the /live page's
+    topomap panels poll every 2+ seconds, so without caching this re-parses
+    a multi-MB EDF file several times a minute. Cache the result per
+    dataset_id (+ any params that change the parse, like a manual sfreq)."""
+    dataset_id = ds["dataset_id"]
+    cache_key = f"{dataset_id}:{args.get('sfreq', '')}:{args.get('npy_orientation', '')}"
+    with _dataset_signal_cache_lock:
+        cached = _dataset_signal_cache.get(cache_key)
+        if cached and (time.time() - cached["ts"]) < ttl:
+            return cached["data"], cached["ch_names"], cached["sfreq"], cached["error"]
+    data_v, ch_names, sfreq, error = load_full_signal_from_dataset(ds, args)
+    with _dataset_signal_cache_lock:
+        _dataset_signal_cache[cache_key] = {
+            "data": data_v, "ch_names": ch_names, "sfreq": sfreq, "error": error, "ts": time.time(),
+        }
+    return data_v, ch_names, sfreq, error
+
+
 def resolve_live_dataset(args):
     source = args.get("source", "auto")
     try:
@@ -1079,7 +1101,7 @@ def resolve_live_dataset(args):
         if ds is None:
             dataset_error = "Dataset not found (it may have been deleted)."
         else:
-            data_v, ds_ch_names, ds_sfreq, dataset_error = load_full_signal_from_dataset(ds, args)
+            data_v, ds_ch_names, ds_sfreq, dataset_error = load_full_signal_from_dataset_cached(ds, args)
             if data_v is not None:
                 return data_v, ds_ch_names, ds_sfreq, {
                     "n_files": 1,
