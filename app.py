@@ -59,7 +59,6 @@ Endpoints:
     GET    /datasets/<dataset_id>/download -> download the original uploaded file
     POST   /datasets/<dataset_id>/reparse  -> re-run parsing with new query-param opts
 
-    POST   /live/stream                    -> ingest real-time EEG chunks and save to MongoDB
     GET    /live                           -> live EEG monitoring dashboard (HTML page)
     GET    /live/report.txt                -> download the session report as text
     GET    /live/api/topomap/<band>.png    -> live topographic-map image for one band
@@ -193,7 +192,6 @@ MONGO_DB_NAME = os.environ.get("MONGO_DB", "eeg_dataset_server")
 MONGO_COLLECTION = "datasets"
 
 mongo_client = None
-mongo_db = None
 mongo_collection = None
 mongo_fs = None  # GridFS bucket - stores the raw uploaded file bytes durably
 MONGO_CONNECTED = False
@@ -205,16 +203,10 @@ if PYMONGO_AVAILABLE:
         mongo_db = mongo_client[MONGO_DB_NAME]
         mongo_collection = mongo_db[MONGO_COLLECTION]
         mongo_fs = gridfs.GridFS(mongo_db, collection="dataset_files")
-        
-        # Create indexes for fast real-time retrieval
-        mongo_collection.create_index([("chunk_index", 1)])
-        mongo_collection.create_index([("timestamp", -1)])
-        
         MONGO_CONNECTED = True
     except Exception as e:
         logging.getLogger("eeg-server").warning("MongoDB unavailable, falling back to in-memory only: %s", e)
         mongo_client = None
-        mongo_db = None
         mongo_collection = None
         mongo_fs = None
         MONGO_CONNECTED = False
@@ -304,9 +296,6 @@ def mongo_load_all():
     try:
         for doc in mongo_collection.find({}):
             doc.pop("_id", None)
-            # Skip any live chunk documents when loading primary dataset metadata
-            if "dataset_id" not in doc:
-                continue
             DATASETS[doc["dataset_id"]] = doc
             loaded += 1
             gridfs_file_id = doc.get("gridfs_file_id")
@@ -839,32 +828,6 @@ LIVE_STATS_LOCK = threading.Lock()
 LIVE_STATS = {"session_start": time.time(), "refresh_count": 0, "regions_seen": set()}
 
 
-def segment_and_store_eeg(raw_eeg_buffer, sfreq, window_sec=1.0):
-    """Segment continuous EEG data into non-overlapping windows."""
-    if not MONGO_CONNECTED:
-        return raw_eeg_buffer
-        
-    samples_per_window = int(sfreq * window_sec)
-    
-    if raw_eeg_buffer.shape[1] >= samples_per_window:
-        # Extract the non-overlapping segment
-        segment = raw_eeg_buffer[:, :samples_per_window]
-        
-        # Store to database
-        mongo_collection.insert_one({
-            "chunk_index": int(time.time() * 1000),
-            "eeg_data": segment.tolist(),
-            "sfreq": sfreq,
-            "segment_duration": window_sec,
-            "timestamp": time.time()
-        })
-        
-        # Return the remaining buffer
-        return raw_eeg_buffer[:, samples_per_window:]
-        
-    return raw_eeg_buffer
-
-
 def _live_first_present(doc, candidate_keys):
     for k in candidate_keys:
         if k in doc and doc[k] is not None:
@@ -880,11 +843,7 @@ def fetch_live_documents(ttl=30):
             return _live_docs_cache["docs"]
     docs = None
     try:
-        # Only fetch live chunk documents, skip uploaded dataset metadata
-        query = {
-            "$or": [{k: {"$exists": True}} for k in LIVE_DATA_KEYS],
-            "dataset_id": {"$exists": False}
-        }
+        query = {"$or": [{k: {"$exists": True}} for k in LIVE_DATA_KEYS]}
         docs = list(mongo_collection.find(query))
     except PyMongoError as e:
         logger.error("Live dashboard: MongoDB fetch failed: %s", e)
@@ -1625,36 +1584,6 @@ def reparse_dataset(dataset_id):
     return jsonify(ds), status_code
 
 
-# --------------------------------------------------------------------------
-# Live Streaming & Dashboard Routes
-# --------------------------------------------------------------------------
-
-@app.route("/live/stream", methods=["POST"])
-def stream_live_chunk():
-    """Ingest real-time EEG chunks from a BCI headset and save to MongoDB."""
-    if not MONGO_CONNECTED:
-        return jsonify({"error": "MongoDB not connected"}), 503
-        
-    payload = request.get_json(silent=True)
-    if not payload or "eeg_data" not in payload:
-        return jsonify({"error": "Invalid payload. 'eeg_data' is required."}), 400
-
-    chunk_record = {
-        "chunk_index": payload.get("chunk_index", int(time.time() * 1000)),
-        "ch_names": payload.get("ch_names", []),
-        "sfreq": payload.get("sfreq", 160),
-        "eeg_data": payload.get("eeg_data"),
-        "timestamp": time.time()
-    }
-    
-    try:
-        mongo_collection.insert_one(chunk_record)
-        return jsonify({"status": "ok", "chunk_index": chunk_record["chunk_index"]}), 200
-    except PyMongoError as e:
-        logger.error("Failed to insert live chunk: %s", e)
-        return jsonify({"error": "Database write failed"}), 500
-
-
 def compute_live_context(args):
     raw_data, ch_names, sfreq, meta = resolve_live_dataset(args)
     window_sec, topo_refresh = live_window_params(args)
@@ -1693,23 +1622,6 @@ def compute_live_context(args):
     band_pct = {k: 100 * v / total_power for k, v in band_powers.items()}
     dominant_band = max(band_pct, key=band_pct.get) if any(band_pct.values()) else None
     recording_seconds = total_samples / sfreq if sfreq else 0
-
-    # Calculate and store Theta/Alpha Ratio (TAR)
-    theta_power = band_powers.get("Theta", 0)
-    alpha_power = band_powers.get("Alpha", 0)
-    tar_value = (theta_power / alpha_power) if alpha_power > 0 else 0
-    
-    if MONGO_CONNECTED and tar_value > 0:
-        try:
-            mongo_db["biomarkers"].insert_one({
-                "timestamp": time.time(),
-                "theta_alpha_ratio": tar_value,
-                "dominant_band": dominant_band,
-                "session_source": meta["source"],
-                "window_sec": window_sec
-            })
-        except Exception as e:
-            logger.error("Failed to insert biomarker: %s", e)
 
     qs = urlencode({
         "source": args.get("source", "auto"),
