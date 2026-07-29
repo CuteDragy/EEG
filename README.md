@@ -3,7 +3,7 @@
 A Flask application with two parts:
 
 1. **REST API** for uploading EEG dataset files (`.csv`, `.tsv`, `.edf`, `.npy`, `.json`) and getting back structural/debug metadata — shape, channels, sampling rate, header info, missing values, etc. It intentionally does **not** run any signal analysis (no filtering, no spectral analysis, no artifact detection).
-2. **Live Monitoring Dashboard** (`/live`) that renders a live-sweeping multichannel EEG chart, per-band topographic maps, and a downloadable session report. This half *does* perform signal analysis (band-pass filtering for band power, montage-based topomaps) and is kept deliberately separate from the analysis-free upload API.
+2. **Live Monitoring Dashboard** (`/live`) that renders a live-sweeping multichannel EEG chart, per-band topographic maps, and a downloadable session report. This half _does_ perform signal analysis (band-pass filtering for band power, montage-based topomaps) and is kept deliberately separate from the analysis-free upload API.
 
 Live demo: **https://eeg-a37i.onrender.com**
 Repo: **github.com/CuteDragy/EEG**
@@ -75,12 +75,12 @@ MongoDB is **optional for local dev** — if `pymongo` can't connect, the app si
 
 ## Environment variables
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `MONGO_URI` | `mongodb://localhost:27017/` | MongoDB connection string. Set this to your Atlas connection string in production. |
-| `MONGO_DB` | `eeg_dataset_server` | Database name to use inside the MongoDB cluster. |
-| `PORT` | `0` (→ Flask default `5000`) | Port the server binds to. Render sets this automatically — don't hardcode a port yourself. |
-| `FLASK_DEBUG` | `true` | Set to `false`/`0` in production. Debug mode should never be left on for a public deployment. |
+| Variable      | Default                      | Purpose                                                                                       |
+| ------------- | ---------------------------- | --------------------------------------------------------------------------------------------- |
+| `MONGO_URI`   | `mongodb://localhost:27017/` | MongoDB connection string. Set this to your Atlas connection string in production.            |
+| `MONGO_DB`    | `eeg_dataset_server`         | Database name to use inside the MongoDB cluster.                                              |
+| `PORT`        | `0` (→ Flask default `5000`) | Port the server binds to. Render sets this automatically — don't hardcode a port yourself.    |
+| `FLASK_DEBUG` | `true`                       | Set to `false`/`0` in production. Debug mode should never be left on for a public deployment. |
 
 Create a `.env` file for local overrides (and load it with `python-dotenv`, or just `export` them in your shell) — just don't commit real credentials to the repo. Add a `.env.example` with blank/placeholder values so contributors know what to set.
 
@@ -127,12 +127,12 @@ The app uses GridFS (via the `gridfs` package, bundled with `pymongo`) alongside
 
 ## Supported file formats
 
-| Extension | What's parsed |
-|---|---|
-| `.csv` / `.tsv` | shape, column/channel names, dtypes, missing values, auto-detected sampling rate (if a `time`/`timestamp` column exists), preview rows |
-| `.edf` | EDF/EDF+ header — patient/recording id, start date/time, number of signals, per-channel labels, units, sampling rate, total duration. Parsed natively, no external EEG library required for the core parse |
-| `.npy` | shape, dtype, number of elements, preview values |
-| `.json` | detects array-of-records vs column-oriented structure, field names, lengths |
+| Extension       | What's parsed                                                                                                                                                                                              |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.csv` / `.tsv` | shape, column/channel names, dtypes, missing values, auto-detected sampling rate (if a `time`/`timestamp` column exists), preview rows                                                                     |
+| `.edf`          | EDF/EDF+ header — patient/recording id, start date/time, number of signals, per-channel labels, units, sampling rate, total duration. Parsed natively, no external EEG library required for the core parse |
+| `.npy`          | shape, dtype, number of elements, preview values                                                                                                                                                           |
+| `.json`         | detects array-of-records vs column-oriented structure, field names, lengths                                                                                                                                |
 
 Max upload size is capped at **500 MB** (`MAX_CONTENT_LENGTH` in `app.py`).
 
@@ -141,22 +141,30 @@ Max upload size is capped at **500 MB** (`MAX_CONTENT_LENGTH` in `app.py`).
 All endpoints return JSON unless noted otherwise.
 
 ### `GET /health`
+
 Liveness check.
 
 ### `GET /stats`
+
 Aggregate stats across all stored datasets (counts, storage totals, format breakdown).
 
 ### `POST /upload`
+
 Upload a dataset file (`multipart/form-data`, field name `file`).
+
 ```bash
 curl -F "file=@my_eeg_recording.edf" https://eeg-a37i.onrender.com/upload
 ```
+
 Returns a JSON record with `dataset_id`, file metadata, `parse_status` (`ok`/`error`), and an `info` object with the format-specific details above. Optional query params:
+
 - `?mne=false` — skip the MNE metadata enrichment block (see [MNE integration](#mne-python-integration))
 - `?sfreq=<hz>` — supply a sampling rate for `.csv`/`.tsv`/`.npy` files where it can't be auto-detected, enabling the MNE block for those formats too
 
 ### `GET /datasets`
+
 List datasets (summary view), with search/filter/sort/pagination:
+
 - `?search=name` — case-insensitive filename substring match
 - `?format=edf` — filter by extension (`csv`/`tsv`/`edf`/`npy`/`json`)
 - `?status=ok|error` — filter by parse status
@@ -165,43 +173,52 @@ List datasets (summary view), with search/filter/sort/pagination:
 - `?limit=20&offset=0` — pagination
 
 ### `GET /datasets/<dataset_id>`
+
 Full stored record (including the detailed `info` block) for one dataset.
 
 ### `GET /datasets/<dataset_id>/view`
+
 HTML detail page for one dataset (rendered via `detail.html`).
 
 ### `GET /datasets/<dataset_id>/channel/<idx>`
+
 Raw signal data for one channel, by index (EDF files only).
 
 ### `PATCH /datasets/<dataset_id>`
+
 Rename a dataset's display filename.
 
 ### `DELETE /datasets/<dataset_id>`
+
 Remove one dataset's record and its stored file.
 
 ### `DELETE /datasets`
+
 Bulk delete — `?ids=a,b,c` for specific datasets, or `?confirm=true` to wipe everything.
 
 ### `GET /datasets/<dataset_id>/download`
+
 Download the original uploaded file as-is.
 
 ### `POST /datasets/<dataset_id>/reparse`
+
 Re-run parsing on an already-uploaded file with new query-param options (e.g. a different `?sfreq=`).
 
 ## `/live` dashboard reference
 
 `GET /live` — renders the live monitoring page. Query params (all optional, combinable):
 
-| Param | Default | Notes |
-|---|---|---|
-| `source` | `auto` | `auto` \| `mongo` \| `dataset` \| `mock` — where the signal comes from |
-| `n_channels` | 64 | channel count for mock data (4–256) |
-| `sfreq` | 160 | sampling rate in Hz for mock data (32–1024) |
-| `regions` | all | comma-separated brain regions to display, e.g. `Frontal,Central` |
-| `window_sec` | 6 | sweep/analysis window in seconds (2–15) |
-| `topo_refresh` | 1.0 | topomap refresh interval in seconds (0.5–3.0) |
+| Param          | Default | Notes                                                                  |
+| -------------- | ------- | ---------------------------------------------------------------------- |
+| `source`       | `auto`  | `auto` \| `mongo` \| `dataset` \| `mock` — where the signal comes from |
+| `n_channels`   | 64      | channel count for mock data (4–256)                                    |
+| `sfreq`        | 160     | sampling rate in Hz for mock data (32–1024)                            |
+| `regions`      | all     | comma-separated brain regions to display, e.g. `Frontal,Central`       |
+| `window_sec`   | 6       | sweep/analysis window in seconds (2–15)                                |
+| `topo_refresh` | 1.0     | topomap refresh interval in seconds (0.5–3.0)                          |
 
 Other `/live` endpoints:
+
 - `GET /live/report.txt` — downloadable session report (band-power breakdown, dominant band, usage summary) as plain text.
 - `GET /live/api/topomap/<band>.png` — live topographic-map image for one band. `band` is one of `Delta`, `Theta`, `Alpha`, `Beta`, `Gamma`, `Broadband`. Requires `mne` and `matplotlib` to be installed; returns `503` otherwise.
 
