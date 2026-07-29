@@ -1,6 +1,9 @@
 import argparse
 import os
 import sys
+import time
+import math
+import random
 
 import requests
 import rich
@@ -11,7 +14,7 @@ from rich.columns import Columns
 from rich import box
 
 # ── Config ───────────────────────────────────────────────────────────────────
-SERVER_URL = "https://eeg-a37i.onrender.com"
+SERVER_URL = "http://localhost:5000" # Changed to localhost for easier live testing
 FILE_PATH  = r"C:\Users\pzhiy\OneDrive - University of Nottingham Malaysia\Files\Internship\Summer25-26\EEG\uploads\S001R02.edf"
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -56,10 +59,6 @@ def display(data: dict):
         eeg_ch = info.get("n_channels", "—")
     file_mb = data.get("file_size_bytes", 0) / (1024 * 1024)
 
-    # EDF: channels is a list of dicts (per-channel metadata), so the first
-    # entry may carry its own sampling_rate_hz. CSV/TSV/NPY/JSON's "channels"
-    # is just a list of names, so fall straight through to the file-level
-    # estimated_sampling_rate_hz instead.
     channels_field = info.get("channels") or []
     first_channel = channels_field[0] if channels_field else None
     sfreq = (
@@ -167,16 +166,6 @@ def display(data: dict):
         meta.add_row("Est. duration", f"{info.get('estimated_duration_seconds', '—')} s")
         console.print(Panel(meta, title="[bold]File Info[/bold]", border_style="dim"))
 
-        ch_table = Table(box=box.SIMPLE_HEAD, header_style="bold cyan", border_style="dim")
-        ch_table.add_column("Channel", style="white")
-        ch_table.add_column("Dtype",   style="dim")
-        ch_table.add_column("Missing", justify="right")
-        dtypes  = info.get("dtypes", {})
-        missing = info.get("missing_values_per_column", {})
-        for col in info.get("channels", []):
-            ch_table.add_row(col, dtypes.get(col, "—"), str(missing.get(col, 0)))
-        console.print(Panel(ch_table, border_style="dim", padding=(0, 1)))
-
     # ── NPY ───────────────────────────────────────────────────────────────────
     elif fmt == "npy":
         meta = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
@@ -186,9 +175,6 @@ def display(data: dict):
         meta.add_row("Dtype",    info.get("dtype", "—"))
         meta.add_row("Ndim",     str(info.get("ndim")))
         meta.add_row("Elements", f"{info.get('size_elements', 0):,}")
-        meta.add_row("Preview",  str(info.get("preview_first_values", [])))
-        if info.get("interpretation_note"):
-            meta.add_row("Note", info["interpretation_note"])
         console.print(Panel(meta, title="[bold]Array Info[/bold]", border_style="dim"))
 
     # ── JSON ──────────────────────────────────────────────────────────────────
@@ -197,24 +183,15 @@ def display(data: dict):
         meta.add_column(style="dim", no_wrap=True)
         meta.add_column(style="white")
         meta.add_row("Top-level type", info.get("top_level_type", "—"))
-        if "n_records" in info:
-            meta.add_row("Records", str(info["n_records"]))
-        if "detected_fields" in info:
-            meta.add_row("Fields", ", ".join(info["detected_fields"]))
-        if "array_fields_with_length" in info:
-            for k, v in info["array_fields_with_length"].items():
-                meta.add_row(f"  {k}", f"{v} samples")
         console.print(Panel(meta, title="[bold]JSON Structure[/bold]", border_style="dim"))
 
-    # ── MNE enrichment (optional, present for any format) ──────────────────────
     display_mne_section(info.get("mne"))
-
     console.print()
 
 
 def display_mne_section(mne_info):
     if not mne_info:
-        return  # ?mne=false was used, or this server version predates MNE support
+        return 
 
     if not mne_info.get("available"):
         reason = mne_info.get("reason") or mne_info.get("error") or "unknown reason"
@@ -229,7 +206,6 @@ def display_mne_section(mne_info):
     type_summary = mne_info.get("ch_types_guess_summary", {})
     type_str = ", ".join(f"{v} {k}" for k, v in type_summary.items()) or "—"
     montage = mne_info.get("montage", {})
-    ann = mne_info.get("annotations", {})
 
     meta = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
     meta.add_column(style="dim", no_wrap=True)
@@ -237,30 +213,13 @@ def display_mne_section(mne_info):
     meta.add_row("MNE version",       mne_info.get("mne_version", "—"))
     meta.add_row("Channels",          f"{mne_info.get('n_channels', '—')} ({type_str})")
     meta.add_row("Sampling rate",     f"{mne_info.get('sfreq_hz', '—')} Hz")
-    meta.add_row("Highpass / Lowpass", f"{mne_info.get('highpass_hz', '—')} / {mne_info.get('lowpass_hz', '—')} Hz")
-    meta.add_row("Duration",          f"{mne_info.get('duration_seconds', '—')} s ({mne_info.get('n_times', '—')} samples)")
-    meta.add_row("Measurement date",  mne_info.get("measurement_date") or "—")
-    meta.add_row("Bad channels",      ", ".join(mne_info.get("bads", [])) or "None")
     meta.add_row(
         "10-20 montage match",
         f"{montage.get('standard_1020_match_pct', '—')}%  "
         f"({len(montage.get('matched_channels', []))}/{mne_info.get('n_channels', '—')} channels)",
     )
 
-    ann_meta = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
-    ann_meta.add_column(style="dim", no_wrap=True)
-    ann_meta.add_column(style="white")
-    ann_meta.add_row("Annotation count", str(ann.get("count", 0)))
-    ann_meta.add_row("Unique labels",    ", ".join(ann.get("unique_descriptions", [])) or "—")
-    events = ann.get("events_from_annotations", {})
-    ann_meta.add_row("Events derived",   str(events.get("n_events", 0)))
-    if events.get("event_id_map"):
-        ann_meta.add_row("Event ID map", ", ".join(f"{k}={v}" for k, v in events["event_id_map"].items()))
-
-    console.print(Columns([
-        Panel(meta,     title="[bold]MNE Summary[/bold]",      border_style="magenta"),
-        Panel(ann_meta, title="[bold]MNE Annotations[/bold]",  border_style="magenta"),
-    ], equal=True, expand=True))
+    console.print(Panel(meta, title="[bold]MNE Summary[/bold]", border_style="magenta"))
 
 
 # ── File management (list / view / rename / delete / download / stats) ───────
@@ -368,8 +327,52 @@ def cmd_upload(args):
     display(result)
 
 
+def cmd_stream(args):
+    """Simulates real-time BCI data stream to the ingestion endpoint."""
+    console.print(f"[bold cyan]Starting live stream simulation to {SERVER_URL}/live/stream...[/bold cyan]")
+    console.print("[dim]Press Ctrl+C to stop.[/dim]\n")
+    
+    n_channels = 16
+    sfreq = 160
+    ch_names = [f"CH{i+1}" for i in range(n_channels)]
+    chunk_size = int(sfreq * 1.0) # 1 second chunks
+    
+    chunk_idx = 0
+    start_time = time.time()
+    
+    try:
+        while True:
+            # Generate 1 second of mock data
+            t = (np.arange(chunk_size) + (chunk_idx * chunk_size)) / sfreq if "numpy" in sys.modules else [x/sfreq for x in range(chunk_size)]
+            
+            chunk_data = []
+            for i in range(n_channels):
+                # Basic sine wave + noise
+                wave = [math.sin(2 * math.pi * 10 * tx) + random.uniform(-0.5, 0.5) for tx in t]
+                chunk_data.append(wave)
+                
+            payload = {
+                "chunk_index": chunk_idx,
+                "ch_names": ch_names,
+                "sfreq": sfreq,
+                "eeg_data": chunk_data
+            }
+            
+            resp = requests.post(f"{SERVER_URL}/live/stream", json=payload)
+            if resp.status_code == 200:
+                console.print(f"✔ Pushed chunk [bold]{chunk_idx}[/bold] (1.0s data)")
+            else:
+                console.print(f"[red]✘ Failed to push chunk {chunk_idx}: {resp.text}[/red]")
+            
+            chunk_idx += 1
+            # Sleep to simulate real-time generation
+            time.sleep(1.0)
+            
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Streaming stopped by user.[/yellow]")
+
+
 def resolve_id(partial_id: str) -> str:
-    """Allows using a short 8-char prefix (as shown by `list`) instead of the full UUID."""
     if len(partial_id) >= 32:
         return partial_id
     data = api_get("/datasets", limit=0)
@@ -379,16 +382,16 @@ def resolve_id(partial_id: str) -> str:
     if len(matches) > 1:
         console.print(f"[red]Ambiguous ID prefix '{partial_id}' matches {len(matches)} datasets.[/red]")
         sys.exit(1)
-    return partial_id  # let the server 404 with a clear error
+    return partial_id
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="EEG Dataset Server client - upload, view, and manage datasets.")
+    p = argparse.ArgumentParser(description="EEG Dataset Server client - upload, view, manage datasets, and stream.")
     p.add_argument("--server", default=SERVER_URL, help=f"Server URL (default: {SERVER_URL})")
     sub = p.add_subparsers(dest="command", required=False)
 
     up = sub.add_parser("upload", help="Upload a file and display its parsed report")
-    up.add_argument("filepath", nargs="?", default=FILE_PATH, help="Path to the file (defaults to configured FILE_PATH)")
+    up.add_argument("filepath", nargs="?", default=FILE_PATH, help="Path to the file")
     up.set_defaults(func=cmd_upload)
 
     ls = sub.add_parser("list", help="List datasets, with optional search/filter/sort")
@@ -426,6 +429,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("stats", help="Show aggregate server/storage stats")
     st.set_defaults(func=cmd_stats)
+    
+    stream_cmd = sub.add_parser("stream", help="Simulate a live data stream to the server")
+    stream_cmd.set_defaults(func=cmd_stream)
 
     return p
 
@@ -433,10 +439,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     parser = build_arg_parser()
     args = parser.parse_args()
-    SERVER_URL = args.server  # allow overriding the configured server for this run
+    SERVER_URL = args.server  
     if args.command is None:
-        # No subcommand given (e.g. run via IDE "Run" button) -> old default behavior:
-        # upload the configured FILE_PATH and display its report.
         cmd_upload(argparse.Namespace(filepath=FILE_PATH))
     else:
         args.func(args)
